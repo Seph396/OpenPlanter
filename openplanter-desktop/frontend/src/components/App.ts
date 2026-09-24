@@ -17,6 +17,15 @@ import {
 } from "../api/invoke";
 import type { ChatMessage } from "../state/store";
 import type { ReplayEntry } from "../api/types";
+import {
+  loadLayoutState,
+  saveLayoutState,
+  resizeLeftWidth,
+  resizeRightWidth,
+  LEFT_DEFAULT,
+  RIGHT_DEFAULT,
+  COLLAPSED_WIDTH,
+} from "../layout/paneLayout";
 
 const PROVIDERS = ["auto", "openai", "anthropic", "openrouter", "cerebras", "ollama"];
 const REASONING_LEVELS = ["none", "low", "medium", "high"];
@@ -133,6 +142,9 @@ export function createApp(root: HTMLElement): void {
   const graphPane = createGraphPane();
   root.appendChild(graphPane);
 
+  // Resizable/collapsible side panes (sidebar + graph pane)
+  setupPaneLayout(root, sidebar, graphPane);
+
   // Reactive settings controls (provider/model/reasoning/recursive/max_depth)
   appState.subscribe(renderSettingsControls);
   renderSettingsControls();
@@ -156,6 +168,164 @@ export function createApp(root: HTMLElement): void {
 
   // Load credentials status
   loadCredentials(credsDisplay);
+}
+
+/**
+ * Wire up drag-to-resize and collapse/expand for the two side panes
+ * (sidebar on the left, graph pane on the right). Widths and collapsed
+ * state are persisted to localStorage and restored on load. The chat pane
+ * in between is untouched — it already fills the remaining `1fr` track.
+ *
+ * Resize/collapse dispatch a debounced "pane-layout-resize" window event so
+ * GraphPane can re-fit its Cytoscape instance without this module needing
+ * to import the (heavy) graph rendering code directly.
+ */
+function setupPaneLayout(root: HTMLElement, leftPane: HTMLElement, rightPane: HTMLElement): void {
+  const state = loadLayoutState();
+
+  const leftGutter = document.createElement("div");
+  leftGutter.className = "pane-gutter";
+  leftGutter.title = "Drag to resize · double-click to reset";
+  leftPane.appendChild(leftGutter);
+
+  const leftChevron = document.createElement("button");
+  leftChevron.type = "button";
+  leftChevron.className = "pane-chevron";
+  leftPane.appendChild(leftChevron);
+
+  const rightGutter = document.createElement("div");
+  rightGutter.className = "pane-gutter";
+  rightGutter.title = "Drag to resize · double-click to reset";
+  rightPane.appendChild(rightGutter);
+
+  const rightChevron = document.createElement("button");
+  rightChevron.type = "button";
+  rightChevron.className = "pane-chevron";
+  rightPane.appendChild(rightChevron);
+
+  let resizeNotifyTimer: ReturnType<typeof setTimeout> | null = null;
+  function notifyResize(): void {
+    if (resizeNotifyTimer) clearTimeout(resizeNotifyTimer);
+    resizeNotifyTimer = setTimeout(() => {
+      resizeNotifyTimer = null;
+      window.dispatchEvent(new CustomEvent("pane-layout-resize"));
+    }, 120);
+  }
+
+  function apply(): void {
+    root.style.setProperty(
+      "--pane-left-width",
+      `${state.leftCollapsed ? COLLAPSED_WIDTH : state.leftWidth}px`
+    );
+    root.style.setProperty(
+      "--pane-right-width",
+      `${state.rightCollapsed ? COLLAPSED_WIDTH : state.rightWidth}px`
+    );
+    leftPane.classList.toggle("pane-collapsed", state.leftCollapsed);
+    rightPane.classList.toggle("pane-collapsed", state.rightCollapsed);
+    leftChevron.textContent = state.leftCollapsed ? "›" : "‹";
+    leftChevron.title = state.leftCollapsed ? "Expand sidebar (⌘[)" : "Collapse sidebar (⌘[)";
+    rightChevron.textContent = state.rightCollapsed ? "‹" : "›";
+    rightChevron.title = state.rightCollapsed
+      ? "Expand graph pane (⌘])"
+      : "Collapse graph pane (⌘])";
+  }
+  apply();
+
+  function toggleLeft(): void {
+    state.leftCollapsed = !state.leftCollapsed;
+    apply();
+    saveLayoutState(state);
+    notifyResize();
+  }
+
+  function toggleRight(): void {
+    state.rightCollapsed = !state.rightCollapsed;
+    apply();
+    saveLayoutState(state);
+    notifyResize();
+  }
+
+  leftChevron.addEventListener("click", toggleLeft);
+  rightChevron.addEventListener("click", toggleRight);
+
+  function bindDrag(
+    gutter: HTMLElement,
+    getStartWidth: () => number,
+    computeWidth: (start: number, deltaX: number) => number,
+    apply_: (width: number) => void,
+    reset: () => void
+  ): void {
+    gutter.addEventListener("dblclick", () => reset());
+
+    gutter.addEventListener("mousedown", (e: MouseEvent) => {
+      e.preventDefault();
+      const startX = e.clientX;
+      const startWidth = getStartWidth();
+      gutter.classList.add("dragging");
+      document.body.style.cursor = "col-resize";
+      document.body.style.userSelect = "none";
+
+      function onMouseMove(ev: MouseEvent): void {
+        apply_(computeWidth(startWidth, ev.clientX - startX));
+        notifyResize();
+      }
+      function onMouseUp(): void {
+        gutter.classList.remove("dragging");
+        document.body.style.cursor = "";
+        document.body.style.userSelect = "";
+        document.removeEventListener("mousemove", onMouseMove);
+        document.removeEventListener("mouseup", onMouseUp);
+        saveLayoutState(state);
+      }
+      document.addEventListener("mousemove", onMouseMove);
+      document.addEventListener("mouseup", onMouseUp);
+    });
+  }
+
+  bindDrag(
+    leftGutter,
+    () => state.leftWidth,
+    resizeLeftWidth,
+    (w) => {
+      state.leftWidth = w;
+      state.leftCollapsed = false; // dragging always expands
+      apply();
+    },
+    () => {
+      state.leftWidth = LEFT_DEFAULT;
+      apply();
+      saveLayoutState(state);
+    }
+  );
+
+  bindDrag(
+    rightGutter,
+    () => state.rightWidth,
+    resizeRightWidth,
+    (w) => {
+      state.rightWidth = w;
+      state.rightCollapsed = false; // dragging always expands
+      apply();
+      notifyResize();
+    },
+    () => {
+      state.rightWidth = RIGHT_DEFAULT;
+      apply();
+      saveLayoutState(state);
+      notifyResize();
+    }
+  );
+
+  // Keyboard shortcuts: Cmd+[ / Cmd+] on macOS, Ctrl+[ / Ctrl+] elsewhere.
+  window.addEventListener("keydown", (e: KeyboardEvent) => {
+    const isMac = navigator.platform.toUpperCase().includes("MAC");
+    const modifierHeld = isMac ? e.metaKey : e.ctrlKey;
+    if (!modifierHeld || (e.key !== "[" && e.key !== "]")) return;
+    e.preventDefault();
+    if (e.key === "[") toggleLeft();
+    else toggleRight();
+  });
 }
 
 /**

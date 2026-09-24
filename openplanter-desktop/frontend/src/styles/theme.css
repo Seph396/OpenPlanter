@@ -27,10 +27,14 @@
   --cat-sanctions: #f778ba;
 
   /* Sizing */
-  --sidebar-width: 220px;
   --statusbar-height: 36px;
   --radius: 6px;
   --radius-lg: 10px;
+
+  /* Resizable/collapsible side panes — overridden inline by PaneLayout at
+     runtime; these are just the first-paint defaults before JS runs. */
+  --pane-left-width: 220px;
+  --pane-right-width: 340px;
 
   /* Typography */
   --font-mono: "JetBrains Mono", "Fira Code", "SF Mono", Menlo, monospace;

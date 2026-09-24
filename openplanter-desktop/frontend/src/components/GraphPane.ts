@@ -521,6 +521,15 @@ export function createGraphPane(): HTMLElement {
     autoRefreshGraph();
   });
 
+  // Re-fit the graph when the pane is resized or expanded from collapsed
+  // (App.ts owns the drag/collapse UI and dispatches this, already
+  // debounced there — cytoGraph's own ResizeObserver also calls cy.resize()
+  // on the canvas element, but an explicit fitView() keeps the view
+  // centered instead of just re-rendering at the old pan/zoom).
+  window.addEventListener("pane-layout-resize", () => {
+    fitView();
+  });
+
   // Listen for session changes — reset baseline
   window.addEventListener("session-changed", ((e: CustomEvent<{ isNew: boolean }>) => {
     const isNew = e.detail?.isNew ?? false;

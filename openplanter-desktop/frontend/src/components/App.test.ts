@@ -703,3 +703,150 @@ describe("session delete confirmation flow", () => {
     });
   });
 });
+
+describe("pane layout: resize/collapse", () => {
+  // happy-dom's global `localStorage` isn't backed by anything in this
+  // vitest/node setup (see src/layout/paneLayout.test.ts for detail), so
+  // stub in an in-memory Storage for every test in this block.
+  function createFakeStorage(): Storage {
+    const store = new Map<string, string>();
+    return {
+      getItem: (k: string) => (store.has(k) ? store.get(k)! : null),
+      setItem: (k: string, v: string) => {
+        store.set(k, v);
+      },
+      removeItem: (k: string) => {
+        store.delete(k);
+      },
+      clear: () => {
+        store.clear();
+      },
+      key: (i: number) => Array.from(store.keys())[i] ?? null,
+      get length() {
+        return store.size;
+      },
+    } as Storage;
+  }
+
+  beforeEach(() => {
+    vi.stubGlobal("localStorage", createFakeStorage());
+    __setHandler("list_sessions", () => [SESSION_B, SESSION_A]);
+    __setHandler("get_credentials_status", () => ({
+      openai: true, anthropic: true, openrouter: false,
+      cerebras: false, ollama: true, exa: false,
+    }));
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    __clearHandlers();
+    document.body.innerHTML = "";
+  });
+
+  function mount(): { root: HTMLElement; sidebar: HTMLElement; graphPane: HTMLElement } {
+    const root = document.createElement("div");
+    document.body.appendChild(root);
+    createApp(root);
+    const gutters = root.querySelectorAll(".pane-gutter");
+    const sidebar = gutters[0].parentElement as HTMLElement;
+    const graphPane = gutters[1].parentElement as HTMLElement;
+    return { root, sidebar, graphPane };
+  }
+
+  it("renders one resize gutter and one collapse chevron on each side pane", () => {
+    const { root } = mount();
+    expect(root.querySelectorAll(".pane-gutter").length).toBe(2);
+    expect(root.querySelectorAll(".pane-chevron").length).toBe(2);
+  });
+
+  it("clicking the sidebar chevron collapses it and persists the state", () => {
+    const { sidebar } = mount();
+    const chevron = sidebar.querySelector(".pane-chevron") as HTMLElement;
+    chevron.click();
+
+    expect(sidebar.classList.contains("pane-collapsed")).toBe(true);
+    const saved = JSON.parse(localStorage.getItem("op.layout.v1")!);
+    expect(saved.leftCollapsed).toBe(true);
+  });
+
+  it("clicking a collapsed chevron again expands the pane and persists it", () => {
+    const { graphPane } = mount();
+    const chevron = graphPane.querySelector(".pane-chevron") as HTMLElement;
+    chevron.click(); // collapse
+    chevron.click(); // expand
+
+    expect(graphPane.classList.contains("pane-collapsed")).toBe(false);
+    const saved = JSON.parse(localStorage.getItem("op.layout.v1")!);
+    expect(saved.rightCollapsed).toBe(false);
+  });
+
+  it("restores collapsed state from localStorage on the next mount", () => {
+    localStorage.setItem(
+      "op.layout.v1",
+      JSON.stringify({ leftWidth: 220, rightWidth: 340, leftCollapsed: true, rightCollapsed: false })
+    );
+    const { sidebar, graphPane } = mount();
+    expect(sidebar.classList.contains("pane-collapsed")).toBe(true);
+    expect(graphPane.classList.contains("pane-collapsed")).toBe(false);
+  });
+
+  it("Ctrl+[ toggles the sidebar collapse state via keyboard", () => {
+    const { sidebar } = mount();
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "[", ctrlKey: true }));
+    expect(sidebar.classList.contains("pane-collapsed")).toBe(true);
+  });
+
+  it("Ctrl+] toggles the graph pane collapse state via keyboard", () => {
+    const { graphPane } = mount();
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "]", ctrlKey: true }));
+    expect(graphPane.classList.contains("pane-collapsed")).toBe(true);
+  });
+
+  it("collapsing the graph pane hides content via a CSS class but keeps its DOM node attached (not destroyed)", () => {
+    const { root, graphPane } = mount();
+    // Stand in for the persistent Cytoscape container: prove it survives collapse.
+    const marker = document.createElement("div");
+    marker.className = "graph-canvas-marker";
+    graphPane.appendChild(marker);
+
+    const chevron = graphPane.querySelector(".pane-chevron") as HTMLElement;
+    chevron.click();
+
+    expect(graphPane.classList.contains("pane-collapsed")).toBe(true);
+    expect(root.contains(marker)).toBe(true);
+    expect(graphPane.contains(marker)).toBe(true);
+  });
+
+  it("double-clicking a gutter resets that pane's width to its default and persists it", () => {
+    const { sidebar } = mount();
+    const gutter = sidebar.querySelector(".pane-gutter") as HTMLElement;
+    gutter.dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
+
+    const saved = JSON.parse(localStorage.getItem("op.layout.v1")!);
+    expect(saved.leftWidth).toBe(220);
+  });
+
+  it("dragging the sidebar gutter clamps the resulting width to [180, 480] and persists on mouseup", () => {
+    const { sidebar } = mount();
+    const gutter = sidebar.querySelector(".pane-gutter") as HTMLElement;
+
+    gutter.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, clientX: 220 }));
+    document.dispatchEvent(new MouseEvent("mousemove", { bubbles: true, clientX: 5000 })); // way past max
+    document.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+
+    const saved = JSON.parse(localStorage.getItem("op.layout.v1")!);
+    expect(saved.leftWidth).toBe(480);
+  });
+
+  it("dragging the graph pane gutter clamps the resulting width to [240, 900] and persists on mouseup", () => {
+    const { graphPane } = mount();
+    const gutter = graphPane.querySelector(".pane-gutter") as HTMLElement;
+
+    gutter.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, clientX: 800 }));
+    document.dispatchEvent(new MouseEvent("mousemove", { bubbles: true, clientX: -5000 })); // way past max
+    document.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+
+    const saved = JSON.parse(localStorage.getItem("op.layout.v1")!);
+    expect(saved.rightWidth).toBe(900);
+  });
+});
