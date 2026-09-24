@@ -177,6 +177,7 @@ function buildSettingsControls(
     maxDepthInput: HTMLInputElement;
     subtaskModelSelect: HTMLSelectElement;
     executeModelSelect: HTMLSelectElement;
+    maxExaAgentCallsInput: HTMLInputElement;
   };
   render: () => void;
 } {
@@ -235,6 +236,11 @@ function buildSettingsControls(
   const executeModelSelect = document.createElement("select");
   executeModelSelect.className = "settings-execute-model-select value";
 
+  const maxExaAgentCallsInput = document.createElement("input");
+  maxExaAgentCallsInput.type = "number";
+  maxExaAgentCallsInput.min = "0";
+  maxExaAgentCallsInput.className = "settings-max-exa-agent-calls-input";
+
   const tierModelHint = document.createElement("div");
   tierModelHint.className = "settings-hint";
   tierModelHint.textContent = "Recommended: sub-agent claude-sonnet-5, leaf claude-haiku-4-5";
@@ -258,7 +264,8 @@ function buildSettingsControls(
     row("max depth", maxDepthInput),
     row("sub-agent model", subtaskModelSelect),
     row("leaf model", executeModelSelect),
-    tierModelHint
+    tierModelHint,
+    row("exa call cap", maxExaAgentCallsInput)
   );
 
   /** Populate the model select with known models for `provider`, keeping `currentModel` selected. */
@@ -342,6 +349,7 @@ function buildSettingsControls(
         maxDepth: config.max_depth,
         subtaskModel: config.subtask_model,
         executeModel: config.execute_model,
+        maxExaAgentCalls: config.max_exa_agent_calls,
       }));
     } catch (e) {
       console.error("Failed to update config:", e);
@@ -389,6 +397,11 @@ function buildSettingsControls(
     applyPartial({ execute_model: executeModelSelect.value });
   });
 
+  maxExaAgentCallsInput.addEventListener("change", () => {
+    const n = parseInt(maxExaAgentCallsInput.value, 10);
+    if (!Number.isNaN(n) && n >= 0) applyPartial({ max_exa_agent_calls: n });
+  });
+
   // Last-rendered snapshot so unrelated appState updates (e.g. token counts
   // ticking during a run) don't overwrite in-progress edits in these controls.
   let last = {
@@ -399,6 +412,7 @@ function buildSettingsControls(
     maxDepth: 0,
     subtaskModel: null as string | null,
     executeModel: null as string | null,
+    maxExaAgentCalls: 0,
   };
   let modelOptionsLoadedFor = "";
   let tierModelOptionsLoadedFor = "";
@@ -430,6 +444,9 @@ function buildSettingsControls(
     if (s.maxDepth !== last.maxDepth) {
       maxDepthInput.value = String(s.maxDepth);
     }
+    if (s.maxExaAgentCalls !== last.maxExaAgentCalls) {
+      maxExaAgentCallsInput.value = String(s.maxExaAgentCalls);
+    }
     last = {
       provider: s.provider,
       model: s.model,
@@ -438,6 +455,7 @@ function buildSettingsControls(
       maxDepth: s.maxDepth,
       subtaskModel: s.subtaskModel,
       executeModel: s.executeModel,
+      maxExaAgentCalls: s.maxExaAgentCalls,
     };
   }
 
@@ -450,6 +468,7 @@ function buildSettingsControls(
       maxDepthInput,
       subtaskModelSelect,
       executeModelSelect,
+      maxExaAgentCallsInput,
     },
     render,
   };
@@ -692,6 +711,7 @@ async function openWorkspacePicker(
       workspace: config.workspace,
       maxDepth: config.max_depth,
       maxStepsPerCall: config.max_steps_per_call,
+      maxExaAgentCalls: config.max_exa_agent_calls,
       messages: [],
       inputTokens: 0,
       outputTokens: 0,

@@ -175,6 +175,58 @@ pub async fn demo_solve(
     emitter.emit_complete(&response);
 }
 
+/// One-time nudge sent when a model turn has no tool calls and non-empty text
+/// but does not end in the `DONE` completion marker (see
+/// `prompts::COMPLETION_PROTOCOL_SECTION`). Deliberate deviation from the
+/// Python reference (which treats any no-tool-call + text turn as final
+/// unconditionally) — a live run showed a `subtask` child narrating "Now I
+/// have sufficient evidence. Let me write the two deliverable files." and
+/// then stopping without writing anything, forcing the parent to relaunch it.
+pub(crate) const TEXT_ONLY_NUDGE: &str = "You replied without a tool call and without DONE. \
+If the work is finished, reply with your final answer ending in DONE. Otherwise continue with \
+the next tool call.";
+
+/// If the last non-empty line of `text` is exactly `DONE` (case-insensitive,
+/// trailing punctuation such as `.`/`!` allowed), returns `text` with that
+/// trailing line removed. Returns `None` otherwise.
+pub(crate) fn strip_trailing_done(text: &str) -> Option<String> {
+    let trimmed_end = text.trim_end();
+    if trimmed_end.is_empty() {
+        return None;
+    }
+    let (before, last_line) = match trimmed_end.rfind('\n') {
+        Some(idx) => (&trimmed_end[..idx], &trimmed_end[idx + 1..]),
+        None => ("", trimmed_end),
+    };
+    let candidate = last_line
+        .trim()
+        .trim_end_matches(|c: char| c.is_ascii_punctuation());
+    if candidate.eq_ignore_ascii_case("done") {
+        Some(before.trim_end().to_string())
+    } else {
+        None
+    }
+}
+
+/// Decide whether a text-only (no tool calls) turn is final, given whether
+/// the one-time completion nudge has already been sent this loop.
+///
+/// Returns `Some(final_text)` when the turn should be treated as final:
+/// either the text ends in a `DONE` marker (stripped from the returned text),
+/// or a nudge was already sent once this loop (in which case `text` is
+/// returned unchanged — see `TEXT_ONLY_NUDGE`'s "or if the work is finished"
+/// framing). Returns `None` when the caller should send `TEXT_ONLY_NUDGE` and
+/// continue the loop instead.
+pub(crate) fn resolve_text_only_turn(text: &str, already_nudged: bool) -> Option<String> {
+    if let Some(stripped) = strip_trailing_done(text) {
+        Some(stripped)
+    } else if already_nudged {
+        Some(text.to_string())
+    } else {
+        None
+    }
+}
+
 /// Rough token estimate: ~4 chars per token.
 fn estimate_tokens(messages: &[Message]) -> usize {
     messages
@@ -254,7 +306,10 @@ pub async fn solve(
     // 2. Build tools and messages
     let tool_mode = if config.recursive { ToolMode::Recursive } else { ToolMode::Flat };
     let tool_defs = build_tool_defs_mode(&provider, tool_mode);
-    let mut tools = WorkspaceTools::new(config);
+    // Shared across depth-0 and every subtask/execute child (see RecursionCtx
+    // and WorkspaceTools::new) so the exa_agent budget applies to the whole run.
+    let exa_call_counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let mut tools = WorkspaceTools::new(config, exa_call_counter.clone());
 
     let system_prompt = build_system_prompt(
         config.recursive,
@@ -269,6 +324,7 @@ pub async fn solve(
         provider: &provider,
         system_prompt: &system_prompt,
         artifacts_dir,
+        exa_call_counter,
     };
     let mut messages = vec![
         Message::System {
@@ -284,6 +340,9 @@ pub async fn solve(
     // 3. Background curator channel
     let (curator_tx, mut curator_rx) = mpsc::unbounded_channel::<CuratorOutcome>();
     let mut curator_handles: Vec<JoinHandle<()>> = Vec::new();
+
+    // Has the one-time TEXT_ONLY_NUDGE already been sent for this loop?
+    let mut text_only_nudged = false;
 
     // 4. Agentic loop
     for step in 1..=max_steps {
@@ -332,31 +391,54 @@ pub async fn solve(
             tool_calls: tool_calls_opt,
         });
 
-        // No tool calls + text present = final answer (matches
-        // agent/engine.py::_solve_recursive: "No tool calls + text present =
-        // final answer", engine.py:442-463 — the system prompt instructs the
-        // model to "stop calling tools and respond with your final answer as
-        // plain text" when done, so Python treats this as final unconditionally;
-        // there is no marker/nudge mechanism gating it).
+        // No tool calls + text present: matches agent/engine.py::_solve_recursive
+        // ("No tool calls + text present = final answer", engine.py:442-463),
+        // except gated by the DONE completion protocol — a deliberate deviation
+        // from Python (which treats this unconditionally as final). See
+        // TEXT_ONLY_NUDGE for why.
         if turn.tool_calls.is_empty() && !turn.text.is_empty() {
-            emitter.emit_step(StepEvent {
-                depth: 0,
-                step: step as u32,
-                tool_name: None,
-                tokens: TokenUsage {
-                    input_tokens: turn.input_tokens,
-                    output_tokens: turn.output_tokens,
-                    cache_creation_input_tokens: turn.cache_creation_input_tokens.unwrap_or(0),
-                    cache_read_input_tokens: turn.cache_read_input_tokens.unwrap_or(0),
-                },
-                elapsed_ms: step_start.elapsed().as_millis() as u64,
-                is_final: true,
-            });
-            emitter.emit_complete(&turn.text);
-            tools.cleanup();
-            // Wait for in-flight curators before exiting
-            finish_curators(&mut curator_handles, &mut curator_rx, &mut messages, emitter).await;
-            return;
+            match resolve_text_only_turn(&turn.text, text_only_nudged) {
+                Some(final_text) => {
+                    emitter.emit_step(StepEvent {
+                        depth: 0,
+                        step: step as u32,
+                        tool_name: None,
+                        tokens: TokenUsage {
+                            input_tokens: turn.input_tokens,
+                            output_tokens: turn.output_tokens,
+                            cache_creation_input_tokens: turn.cache_creation_input_tokens.unwrap_or(0),
+                            cache_read_input_tokens: turn.cache_read_input_tokens.unwrap_or(0),
+                        },
+                        elapsed_ms: step_start.elapsed().as_millis() as u64,
+                        is_final: true,
+                    });
+                    emitter.emit_complete(&final_text);
+                    tools.cleanup();
+                    // Wait for in-flight curators before exiting
+                    finish_curators(&mut curator_handles, &mut curator_rx, &mut messages, emitter).await;
+                    return;
+                }
+                None => {
+                    text_only_nudged = true;
+                    emitter.emit_step(StepEvent {
+                        depth: 0,
+                        step: step as u32,
+                        tool_name: None,
+                        tokens: TokenUsage {
+                            input_tokens: turn.input_tokens,
+                            output_tokens: turn.output_tokens,
+                            cache_creation_input_tokens: turn.cache_creation_input_tokens.unwrap_or(0),
+                            cache_read_input_tokens: turn.cache_read_input_tokens.unwrap_or(0),
+                        },
+                        elapsed_ms: step_start.elapsed().as_millis() as u64,
+                        is_final: false,
+                    });
+                    messages.push(Message::User {
+                        content: TEXT_ONLY_NUDGE.into(),
+                    });
+                    continue;
+                }
+            }
         }
 
         // No tool calls AND no text = unexpected empty response. Python
@@ -786,5 +868,99 @@ mod tests {
         if let Message::Tool { content, .. } = last_tool {
             assert_eq!(content.len(), 8000, "recent tool result should be intact");
         }
+    }
+
+    // ── strip_trailing_done / resolve_text_only_turn ──
+
+    #[test]
+    fn test_strip_trailing_done_exact_match() {
+        assert_eq!(strip_trailing_done("DONE"), Some(String::new()));
+        assert_eq!(
+            strip_trailing_done("Found the answer.\nDONE"),
+            Some("Found the answer.".to_string())
+        );
+    }
+
+    #[test]
+    fn test_strip_trailing_done_case_insensitive_and_punctuation() {
+        assert_eq!(
+            strip_trailing_done("All set.\ndone."),
+            Some("All set.".to_string())
+        );
+        assert_eq!(
+            strip_trailing_done("All set.\nDoNe!!!"),
+            Some("All set.".to_string())
+        );
+    }
+
+    #[test]
+    fn test_strip_trailing_done_trailing_whitespace_after_marker() {
+        assert_eq!(
+            strip_trailing_done("Wrapping up.\nDONE\n\n  "),
+            Some("Wrapping up.".to_string())
+        );
+    }
+
+    #[test]
+    fn test_strip_trailing_done_no_match() {
+        assert_eq!(strip_trailing_done("Still working on it"), None);
+        // Whole-line match only — a word containing "done" doesn't count.
+        assert_eq!(strip_trailing_done("This task is UNDONE"), None);
+        // DONE must be the LAST non-empty line, not just present somewhere.
+        assert_eq!(
+            strip_trailing_done("DONE\nActually, one more thing"),
+            None
+        );
+        assert_eq!(strip_trailing_done(""), None);
+    }
+
+    #[test]
+    fn test_resolve_text_only_turn_done_marker_finalizes_and_strips() {
+        let result = resolve_text_only_turn("Analysis complete.\nDONE", false);
+        assert_eq!(result, Some("Analysis complete.".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_text_only_turn_no_marker_not_nudged_yet_returns_none() {
+        // "nudge once then continue": first text-only turn without DONE must
+        // NOT finalize — caller is expected to send TEXT_ONLY_NUDGE instead.
+        let result = resolve_text_only_turn("Now I have sufficient evidence.", false);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_resolve_text_only_turn_second_turn_after_nudge_finalizes() {
+        // Once a nudge has already been sent this loop, any further text-only
+        // turn is final even without a DONE marker.
+        let result = resolve_text_only_turn("Still no marker here", true);
+        assert_eq!(result, Some("Still no marker here".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_text_only_turn_done_marker_wins_even_if_already_nudged() {
+        let result = resolve_text_only_turn("Wrapping up.\nDONE", true);
+        assert_eq!(result, Some("Wrapping up.".to_string()));
+    }
+
+    /// `solve()` (depth-0) resolves its model via `build_model(config)`, which
+    /// is not injectable, so its loop isn't reachable with a mock model —
+    /// unlike `engine::subagent::run_child`, which IS integration-tested with
+    /// a `MockModel` (see `subagent::tests::test_run_child_nudges_once_then_*`
+    /// below). `solve()`'s text-only-turn branch calls the exact same
+    /// `resolve_text_only_turn` function subagent's loop calls (see
+    /// `mod.rs`'s "No tool calls + text present" branch vs. subagent.rs's),
+    /// so this test locks down the two-turn sequence solve() performs by
+    /// driving that shared function directly, in the order solve() calls it.
+    #[test]
+    fn test_solve_text_only_turn_nudges_once_then_finalizes_with_done_stripped() {
+        let mut nudged = false;
+        // Turn 1: narrating without DONE — must not finalize, must nudge.
+        let turn1 = resolve_text_only_turn("Now I have sufficient evidence. Let me write the files.", nudged);
+        assert_eq!(turn1, None, "first text-only turn without DONE must nudge, not finalize");
+        nudged = true;
+
+        // Turn 2: model complies and ends with DONE — finalizes, DONE stripped.
+        let turn2 = resolve_text_only_turn("Wrote both deliverable files.\nDONE", nudged);
+        assert_eq!(turn2, Some("Wrote both deliverable files.".to_string()));
     }
 }

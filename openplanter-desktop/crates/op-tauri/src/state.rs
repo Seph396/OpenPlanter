@@ -85,6 +85,8 @@ pub struct UiPrefs {
     pub subtask_model: Option<String>,
     #[serde(default)]
     pub execute_model: Option<String>,
+    #[serde(default)]
+    pub max_exa_agent_calls: Option<u32>,
 }
 
 fn ui_prefs_path(workspace: &Path) -> PathBuf {
@@ -137,6 +139,9 @@ fn apply_ui_prefs(cfg: &mut AgentConfig) {
     }
     if prefs.execute_model.is_some() {
         cfg.execute_model = prefs.execute_model;
+    }
+    if let Some(max_exa_agent_calls) = prefs.max_exa_agent_calls {
+        cfg.max_exa_agent_calls = max_exa_agent_calls;
     }
 }
 
@@ -366,6 +371,7 @@ mod tests {
             max_depth: Some(6),
             subtask_model: Some("claude-sonnet-5".into()),
             execute_model: Some("claude-haiku-4-5".into()),
+            max_exa_agent_calls: Some(20),
         };
         save_ui_prefs(dir.path(), &prefs).unwrap();
         let loaded = load_ui_prefs(dir.path());
@@ -376,6 +382,7 @@ mod tests {
         assert_eq!(loaded.max_depth, Some(6));
         assert_eq!(loaded.subtask_model, Some("claude-sonnet-5".into()));
         assert_eq!(loaded.execute_model, Some("claude-haiku-4-5".into()));
+        assert_eq!(loaded.max_exa_agent_calls, Some(20));
     }
 
     #[test]
@@ -398,6 +405,7 @@ mod tests {
             max_depth: Some(9),
             subtask_model: None,
             execute_model: None,
+            max_exa_agent_calls: Some(7),
         };
         save_ui_prefs(dir.path(), &prefs).unwrap();
 
@@ -407,6 +415,7 @@ mod tests {
         assert_eq!(cfg.provider, "cerebras");
         assert!(!cfg.recursive);
         assert_eq!(cfg.max_depth, 9);
+        assert_eq!(cfg.max_exa_agent_calls, 7);
     }
 
     // ── save_credential / Keychain arg builder ──

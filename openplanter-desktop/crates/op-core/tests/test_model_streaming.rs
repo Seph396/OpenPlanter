@@ -424,7 +424,20 @@ async fn test_solve_with_mock_anthropic() {
     use op_core::engine::{solve, SolveEmitter};
     use op_core::events::StepEvent;
 
-    let addr = start_mock_sse_server(ANTHROPIC_SSE_SIMPLE).await;
+    // Ends in a DONE marker line (op_core::prompts::COMPLETION_PROTOCOL_SECTION)
+    // so solve() finalizes on the first turn instead of nudging once — this is
+    // a static (non-stateful) mock server, so a nudge would just re-serve the
+    // identical response on the retry rather than progressing the script.
+    const ANTHROPIC_SSE_SIMPLE_DONE: &str = "\
+event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":25}}}\n\n\
+event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n\n\
+event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" from Claude\\nDONE\"}}\n\n\
+event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":4}}\n\n\
+event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+
+    let addr = start_mock_sse_server(ANTHROPIC_SSE_SIMPLE_DONE).await;
 
     #[derive(Debug, Clone)]
     enum Ev {
@@ -479,7 +492,9 @@ async fn test_solve_with_mock_anthropic() {
         "should have a trace mentioning anthropic"
     );
 
-    // Should have text deltas
+    // Should have text deltas (raw streamed text, including the DONE marker
+    // line — solve() strips DONE from the final answer, not from the delta
+    // stream itself)
     let text_content: String = recorded
         .iter()
         .filter_map(|e| match e {
@@ -487,7 +502,7 @@ async fn test_solve_with_mock_anthropic() {
             _ => None,
         })
         .collect();
-    assert_eq!(text_content, "Hello from Claude");
+    assert_eq!(text_content, "Hello from Claude\nDONE");
 
     // Should have a step
     assert!(
@@ -495,10 +510,10 @@ async fn test_solve_with_mock_anthropic() {
         "should have a final step with correct token count"
     );
 
-    // Should have complete with the full text
+    // Should have complete with the full text, DONE marker stripped
     assert!(
         recorded.iter().any(|e| matches!(e, Ev::Complete(t) if t == "Hello from Claude")),
-        "should complete with full text"
+        "should complete with full text, DONE stripped"
     );
 
     // Should NOT have an error
@@ -514,7 +529,18 @@ async fn test_solve_with_mock_openai() {
     use op_core::engine::{solve, SolveEmitter};
     use op_core::events::StepEvent;
 
-    let addr = start_mock_sse_server(OPENAI_SSE_SIMPLE).await;
+    // Ends in a DONE marker line (op_core::prompts::COMPLETION_PROTOCOL_SECTION)
+    // so solve() finalizes on the first turn instead of nudging once — this is
+    // a static (non-stateful) mock server, so a nudge would just re-serve the
+    // identical response on the retry rather than progressing the script.
+    const OPENAI_SSE_SIMPLE_DONE: &str = "\
+data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"index\":0}]}\n\n\
+data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"index\":0}]}\n\n\
+data: {\"choices\":[{\"delta\":{\"content\":\" world\\nDONE\"},\"index\":0}]}\n\n\
+data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\",\"index\":0}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2}}\n\n\
+data: [DONE]\n\n";
+
+    let addr = start_mock_sse_server(OPENAI_SSE_SIMPLE_DONE).await;
 
     #[derive(Debug, Clone)]
     #[allow(dead_code)]
@@ -572,7 +598,9 @@ async fn test_solve_with_mock_openai() {
         recorded.iter().filter_map(|e| match e { Ev2::Trace(m) => Some(m.clone()), _ => None }).collect::<Vec<_>>()
     );
 
-    // Should have text deltas that spell "Hello world"
+    // Should have text deltas that spell "Hello world\nDONE" (raw streamed
+    // text, including the DONE marker line — solve() strips DONE from the
+    // final answer, not from the delta stream itself)
     let text_content: String = recorded
         .iter()
         .filter_map(|e| match e {
@@ -580,7 +608,7 @@ async fn test_solve_with_mock_openai() {
             _ => None,
         })
         .collect();
-    assert_eq!(text_content, "Hello world");
+    assert_eq!(text_content, "Hello world\nDONE");
 
     // Should have a step with correct tokens
     assert!(
@@ -588,7 +616,7 @@ async fn test_solve_with_mock_openai() {
         "should have a final step with 10 input tokens"
     );
 
-    // Should complete with the full text
+    // Should complete with the full text, DONE marker stripped
     assert!(
         recorded.iter().any(|e| matches!(e, Ev2::Complete(t) if t == "Hello world")),
         "should complete with 'Hello world'"

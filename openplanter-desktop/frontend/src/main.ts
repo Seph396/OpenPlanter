@@ -43,6 +43,7 @@ async function init() {
       maxStepsPerCall: config.max_steps_per_call,
       subtaskModel: config.subtask_model,
       executeModel: config.execute_model,
+      maxExaAgentCalls: config.max_exa_agent_calls,
     }));
   } catch (e) {
     console.error("Failed to load config:", e);

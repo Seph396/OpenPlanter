@@ -75,6 +75,7 @@ export interface ConfigView {
   demo: boolean;
   subtask_model: string | null;
   execute_model: string | null;
+  max_exa_agent_calls: number;
 }
 
 export interface PartialConfig {
@@ -87,6 +88,7 @@ export interface PartialConfig {
   subtask_model?: string;
   /** Empty string clears the override back to "inherit". */
   execute_model?: string;
+  max_exa_agent_calls?: number;
 }
 
 export interface ModelInfo {

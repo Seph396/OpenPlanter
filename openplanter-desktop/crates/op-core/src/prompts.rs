@@ -377,6 +377,10 @@ BAD criteria (not independently checkable):
     acceptance_criteria="All validation checks PASSED; no ERROR lines in output"
   )"#;
 
+pub const COMPLETION_PROTOCOL_SECTION: &str = r#"
+== COMPLETION ==
+When your work is complete, end your final message with the line `DONE`."#;
+
 pub const DEMO_SECTION: &str = r#"
 
 ## Demo Mode (ACTIVE)
@@ -403,6 +407,7 @@ pub fn build_system_prompt(recursive: bool, acceptance_criteria: bool, demo: boo
     if demo {
         prompt.push_str(DEMO_SECTION);
     }
+    prompt.push_str(COMPLETION_PROTOCOL_SECTION);
     prompt
 }
 
@@ -431,6 +436,23 @@ mod tests {
         assert!(prompt.contains("ACCEPTANCE CRITERIA"));
         assert!(prompt.contains("VERIFICATION PRINCIPLE"));
         assert!(prompt.contains("Demo Mode"));
+    }
+
+    #[test]
+    fn test_build_system_prompt_always_includes_completion_protocol() {
+        for (recursive, acceptance, demo) in [
+            (false, false, false),
+            (true, false, false),
+            (true, true, false),
+            (true, true, true),
+        ] {
+            let prompt = build_system_prompt(recursive, acceptance, demo);
+            assert!(
+                prompt.contains("== COMPLETION =="),
+                "expected COMPLETION section for ({recursive}, {acceptance}, {demo})"
+            );
+            assert!(prompt.trim_end().ends_with("end your final message with the line `DONE`."));
+        }
     }
 
     #[test]

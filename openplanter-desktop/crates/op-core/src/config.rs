@@ -32,6 +32,13 @@ fn env_int(key: &str, default: i64) -> i64 {
         .unwrap_or(default)
 }
 
+fn env_u32(key: &str, default: u32) -> u32 {
+    env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
 fn env_bool(key: &str, default: bool) -> bool {
     match env::var(key) {
         Ok(v) => matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes"),
@@ -86,6 +93,10 @@ pub struct AgentConfig {
     pub max_plan_chars: i64,
     pub max_turn_summaries: i64,
     pub demo: bool,
+    /// Hard cap on `exa_agent` calls per run, shared across depth-0 and all
+    /// `subtask`/`execute` children (a single counter for the whole run, not
+    /// per-level). Counts only calls that actually issued the HTTP request.
+    pub max_exa_agent_calls: u32,
 
     /// Model used for `subtask` children when set. `None` = inherit the
     /// parent's model. Downward-only tier enforcement (see
@@ -136,6 +147,7 @@ impl Default for AgentConfig {
             max_plan_chars: 40_000,
             max_turn_summaries: 50,
             demo: false,
+            max_exa_agent_calls: 12,
             subtask_model: None,
             execute_model: None,
         }
@@ -236,6 +248,7 @@ impl AgentConfig {
             max_plan_chars: env_int("OPENPLANTER_MAX_PLAN_CHARS", 40_000),
             max_turn_summaries: env_int("OPENPLANTER_MAX_TURN_SUMMARIES", 50),
             demo: env_bool("OPENPLANTER_DEMO", false),
+            max_exa_agent_calls: env_u32("OPENPLANTER_MAX_EXA_AGENT_CALLS", 12),
             subtask_model: env_opt("OPENPLANTER_SUBTASK_MODEL"),
             execute_model: env_opt("OPENPLANTER_EXECUTE_MODEL"),
         }
@@ -279,6 +292,24 @@ mod tests {
         assert!(cfg.recursive);
         assert!(cfg.acceptance_criteria);
         assert!(!cfg.demo);
+        assert_eq!(cfg.max_exa_agent_calls, 12);
+    }
+
+    #[test]
+    fn test_max_exa_agent_calls_from_env() {
+        let key = "OPENPLANTER_MAX_EXA_AGENT_CALLS";
+        let saved = env::var(key).ok();
+        unsafe {
+            env::set_var(key, "3");
+        }
+        let cfg = AgentConfig::from_env("/tmp");
+        assert_eq!(cfg.max_exa_agent_calls, 3);
+        unsafe {
+            match saved {
+                Some(v) => env::set_var(key, v),
+                None => env::remove_var(key),
+            }
+        }
     }
 
     #[test]

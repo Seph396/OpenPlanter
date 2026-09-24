@@ -24,6 +24,7 @@ pub struct PartialConfig {
     pub subtask_model: Option<String>,
     /// `Some("")` clears the override back to "inherit"; `None` leaves it unchanged.
     pub execute_model: Option<String>,
+    pub max_exa_agent_calls: Option<u32>,
 }
 
 /// Get the current configuration.
@@ -45,6 +46,7 @@ pub async fn get_config(
         demo: cfg.demo,
         subtask_model: cfg.subtask_model.clone(),
         execute_model: cfg.execute_model.clone(),
+        max_exa_agent_calls: cfg.max_exa_agent_calls,
     })
 }
 
@@ -75,6 +77,9 @@ pub fn apply_partial_config(cfg: &mut op_core::config::AgentConfig, partial: Par
     if let Some(execute_model) = partial.execute_model {
         cfg.execute_model = if execute_model.is_empty() { None } else { Some(execute_model) };
     }
+    if let Some(max_exa_agent_calls) = partial.max_exa_agent_calls {
+        cfg.max_exa_agent_calls = max_exa_agent_calls;
+    }
 }
 
 /// Update configuration fields.
@@ -95,6 +100,7 @@ pub async fn update_config(
         max_depth: Some(cfg.max_depth),
         subtask_model: cfg.subtask_model.clone(),
         execute_model: cfg.execute_model.clone(),
+        max_exa_agent_calls: Some(cfg.max_exa_agent_calls),
     };
     if let Err(e) = save_ui_prefs(&cfg.workspace, &prefs) {
         eprintln!("[config] failed to persist UI prefs: {e}");
@@ -113,6 +119,7 @@ pub async fn update_config(
         demo: cfg.demo,
         subtask_model: cfg.subtask_model.clone(),
         execute_model: cfg.execute_model.clone(),
+        max_exa_agent_calls: cfg.max_exa_agent_calls,
     })
 }
 
@@ -247,6 +254,7 @@ pub async fn set_workspace(
         demo: cfg.demo,
         subtask_model: cfg.subtask_model.clone(),
         execute_model: cfg.execute_model.clone(),
+        max_exa_agent_calls: cfg.max_exa_agent_calls,
     })
 }
 
@@ -495,6 +503,25 @@ mod tests {
     }
 
     #[test]
+    fn test_apply_partial_config_max_exa_agent_calls() {
+        let mut cfg = op_core::config::AgentConfig::from_env("/nonexistent");
+        cfg.max_exa_agent_calls = 12;
+
+        apply_partial_config(
+            &mut cfg,
+            PartialConfig {
+                max_exa_agent_calls: Some(5),
+                ..Default::default()
+            },
+        );
+        assert_eq!(cfg.max_exa_agent_calls, 5);
+
+        // None leaves it unchanged.
+        apply_partial_config(&mut cfg, PartialConfig::default());
+        assert_eq!(cfg.max_exa_agent_calls, 5);
+    }
+
+    #[test]
     fn test_apply_partial_config_none_fields_preserve_existing() {
         let mut cfg = op_core::config::AgentConfig::from_env("/nonexistent");
         cfg.recursive = true;
@@ -522,6 +549,7 @@ mod tests {
                 max_depth: Some(2),
                 subtask_model: Some("claude-sonnet-5".to_string()),
                 execute_model: Some("claude-haiku-4-5".to_string()),
+                max_exa_agent_calls: Some(20),
             },
         );
 
@@ -532,6 +560,7 @@ mod tests {
         assert_eq!(cfg.max_depth, 2);
         assert_eq!(cfg.subtask_model, Some("claude-sonnet-5".to_string()));
         assert_eq!(cfg.execute_model, Some("claude-haiku-4-5".to_string()));
+        assert_eq!(cfg.max_exa_agent_calls, 20);
     }
 
     #[test]

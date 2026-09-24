@@ -204,6 +204,39 @@ describe("createApp", () => {
     });
   });
 
+  it("editing the exa call cap input calls update_config with the new value", async () => {
+    let received: any = null;
+    __setHandler("update_config", (partial: any) => {
+      received = partial;
+      return {
+        provider: "anthropic",
+        model: "claude-opus-4-6",
+        reasoning_effort: null,
+        workspace: "/tmp/ws",
+        session_id: null,
+        recursive: true,
+        max_depth: 4,
+        max_steps_per_call: 100,
+        demo: false,
+        max_exa_agent_calls: 5,
+      };
+    });
+
+    const root = document.createElement("div");
+    document.body.appendChild(root);
+    createApp(root);
+
+    const input = root.querySelector(".settings-max-exa-agent-calls-input") as HTMLInputElement;
+    expect(input).not.toBeNull();
+    input.value = "5";
+    input.dispatchEvent(new Event("change"));
+
+    await vi.waitFor(() => {
+      expect(received.partial).toEqual({ max_exa_agent_calls: 5 });
+      expect(appState.get().maxExaAgentCalls).toBe(5);
+    });
+  });
+
   it("changing the provider select calls update_config with the new provider", async () => {
     let received: any = null;
     __setHandler("update_config", (partial: any) => {

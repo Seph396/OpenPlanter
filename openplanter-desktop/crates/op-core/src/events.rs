@@ -139,6 +139,9 @@ pub struct ConfigView {
     /// then the parent's model, when `None`.
     #[serde(default)]
     pub execute_model: Option<String>,
+    /// Hard cap on `exa_agent` calls per run, shared across depth-0 and all children.
+    #[serde(default)]
+    pub max_exa_agent_calls: u32,
 }
 
 /// Partial configuration update from the frontend.

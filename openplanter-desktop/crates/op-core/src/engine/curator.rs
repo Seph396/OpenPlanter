@@ -148,7 +148,13 @@ pub async fn run_curator(
 
     let provider = model.provider_name().to_string();
     let tool_defs = build_curator_tool_defs(&provider);
-    let mut tools = WorkspaceTools::new(config);
+    // The curator's restricted tool set never includes exa_agent, so it
+    // doesn't share the main run's exa_agent budget — a fresh, unused counter
+    // is fine here.
+    let mut tools = WorkspaceTools::new(
+        config,
+        std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+    );
 
     let mut messages = vec![
         Message::System {

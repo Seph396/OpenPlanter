@@ -1,5 +1,8 @@
 /// Web tools: Exa search, fetch_url.
 
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+
 use serde_json::json;
 
 use super::ToolResult;
@@ -260,6 +263,25 @@ pub fn format_exa_agent_output(run: &serde_json::Value) -> String {
 /// terminal status (or `timeout_sec` elapses), and return `output.text`
 /// plus grounding citation URLs as the observation.
 #[allow(clippy::too_many_arguments)]
+/// Atomically check-and-increment `call_counter` against `max_calls`. Returns
+/// `Ok(call_number)` (1-based) when the call is allowed and the counter has
+/// already been incremented to reflect it; `Err(current_count)` when the
+/// budget is exhausted and the counter was left unchanged. Shared across
+/// depth-0 and every `subtask`/`execute` child via the same `Arc`, so
+/// concurrent callers never overrun `max_calls`.
+fn try_reserve_exa_agent_call(call_counter: &AtomicU32, max_calls: u32) -> Result<u32, u32> {
+    call_counter
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| {
+            if c < max_calls {
+                Some(c + 1)
+            } else {
+                None
+            }
+        })
+        .map(|prev| prev + 1)
+        .map_err(|current| current)
+}
+
 pub async fn exa_agent(
     exa_api_key: Option<&str>,
     exa_base_url: &str,
@@ -269,6 +291,8 @@ pub async fn exa_agent(
     effort: Option<&str>,
     max_observation_chars: usize,
     timeout_sec: u64,
+    call_counter: &Arc<AtomicU32>,
+    max_calls: u32,
 ) -> ToolResult {
     let query = query.trim();
     if query.is_empty() {
@@ -279,6 +303,14 @@ pub async fn exa_agent(
         Some(k) if !k.trim().is_empty() => k,
         _ => return ToolResult::error("EXA_API_KEY not configured".into()),
     };
+
+    // Reserve budget right before issuing the HTTP request — only calls that
+    // actually proceed to the request count against `max_calls`.
+    if let Err(current) = try_reserve_exa_agent_call(call_counter, max_calls) {
+        return ToolResult::error(format!(
+            "exa_agent budget exhausted ({current}/{max_calls}). Use web_search or local records."
+        ));
+    }
 
     let payload = build_exa_agent_payload(query, data_sources, output_schema, effort);
     let base = exa_base_url.trim_end_matches('/');
@@ -442,15 +474,68 @@ mod exa_agent_tests {
 
     #[tokio::test]
     async fn test_exa_agent_requires_api_key() {
-        let result = exa_agent(None, "https://api.exa.ai", "query", None, None, None, 6000, 45).await;
+        let counter = Arc::new(AtomicU32::new(0));
+        let result = exa_agent(None, "https://api.exa.ai", "query", None, None, None, 6000, 45, &counter, 12).await;
         assert!(result.is_error);
         assert!(result.content.contains("EXA_API_KEY not configured"));
+        assert_eq!(counter.load(Ordering::SeqCst), 0, "no HTTP request issued, budget must not be spent");
     }
 
     #[tokio::test]
     async fn test_exa_agent_requires_nonempty_query() {
-        let result = exa_agent(Some("key"), "https://api.exa.ai", "   ", None, None, None, 6000, 45).await;
+        let counter = Arc::new(AtomicU32::new(0));
+        let result = exa_agent(Some("key"), "https://api.exa.ai", "   ", None, None, None, 6000, 45, &counter, 12).await;
         assert!(result.is_error);
         assert!(result.content.contains("non-empty query"));
+        assert_eq!(counter.load(Ordering::SeqCst), 0, "no HTTP request issued, budget must not be spent");
+    }
+
+    // ── exa_agent call cap ──
+
+    #[test]
+    fn test_try_reserve_exa_agent_call_allows_up_to_max() {
+        let counter = AtomicU32::new(0);
+        assert_eq!(try_reserve_exa_agent_call(&counter, 2), Ok(1));
+        assert_eq!(try_reserve_exa_agent_call(&counter, 2), Ok(2));
+        assert_eq!(try_reserve_exa_agent_call(&counter, 2), Err(2));
+        // Counter is left at the cap, not incremented past it, after a
+        // rejected reservation.
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_exa_agent_errors_at_cap_without_issuing_request() {
+        let counter = Arc::new(AtomicU32::new(3));
+        let result = exa_agent(
+            Some("key"), "https://api.exa.ai", "find officers", None, None, None, 6000, 45, &counter, 3,
+        )
+        .await;
+        assert!(result.is_error);
+        assert!(
+            result.content.contains("exa_agent budget exhausted (3/3)"),
+            "got: {}",
+            result.content
+        );
+        assert!(result.content.contains("Use web_search or local records."));
+        // Rejected reservation must not perturb the counter.
+        assert_eq!(counter.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn test_exa_agent_counter_shared_between_parent_and_child_contexts() {
+        // Mirrors how engine::solve and engine::subagent::run_child thread
+        // the SAME Arc<AtomicU32> into every WorkspaceTools they create.
+        let shared = Arc::new(AtomicU32::new(0));
+        let parent_view = shared.clone();
+        let child_view = shared.clone();
+
+        assert_eq!(try_reserve_exa_agent_call(&parent_view, 5), Ok(1));
+        assert_eq!(try_reserve_exa_agent_call(&child_view, 5), Ok(2));
+        assert_eq!(try_reserve_exa_agent_call(&parent_view, 5), Ok(3));
+
+        // All three views observe the same accumulated count.
+        assert_eq!(shared.load(Ordering::SeqCst), 3);
+        assert_eq!(parent_view.load(Ordering::SeqCst), 3);
+        assert_eq!(child_view.load(Ordering::SeqCst), 3);
     }
 }

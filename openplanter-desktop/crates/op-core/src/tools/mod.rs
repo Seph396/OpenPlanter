@@ -11,6 +11,8 @@ pub mod patching;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU32;
+use std::sync::Arc;
 
 use crate::config::AgentConfig;
 
@@ -49,12 +51,24 @@ pub struct WorkspaceTools {
     max_observation_chars: usize,
     exa_api_key: Option<String>,
     exa_base_url: String,
+    max_exa_agent_calls: u32,
+    /// Hard cap on `exa_agent` calls per run. Shared (not per-instance) —
+    /// the caller (`engine::solve`/`engine::subagent::run_child`) threads the
+    /// SAME `Arc` into every `WorkspaceTools` it creates across depth-0 and
+    /// all `subtask`/`execute` children so the cap applies to the whole run,
+    /// not per recursion level.
+    exa_call_counter: Arc<AtomicU32>,
     files_read: HashSet<PathBuf>,
     bg_jobs: shell::BgJobs,
 }
 
 impl WorkspaceTools {
-    pub fn new(config: &AgentConfig) -> Self {
+    /// `exa_call_counter` must be the SAME `Arc` across every `WorkspaceTools`
+    /// created for one `solve()` run (depth-0 and all children) — see the
+    /// field doc above. Callers that don't run any tools sharing this budget
+    /// (e.g. the wiki curator, which never exposes `exa_agent`) may pass a
+    /// fresh `Arc::new(AtomicU32::new(0))`.
+    pub fn new(config: &AgentConfig, exa_call_counter: Arc<AtomicU32>) -> Self {
         Self {
             root: config.workspace.clone(),
             shell_path: config.shell.clone(),
@@ -66,6 +80,8 @@ impl WorkspaceTools {
             max_observation_chars: config.max_observation_chars as usize,
             exa_api_key: config.exa_api_key.clone(),
             exa_base_url: config.exa_base_url.clone(),
+            max_exa_agent_calls: config.max_exa_agent_calls,
+            exa_call_counter,
             files_read: HashSet::new(),
             bg_jobs: shell::BgJobs::new(),
         }
@@ -193,6 +209,8 @@ impl WorkspaceTools {
                     effort,
                     self.max_observation_chars,
                     self.command_timeout_sec,
+                    &self.exa_call_counter,
+                    self.max_exa_agent_calls,
                 )
                 .await
             }

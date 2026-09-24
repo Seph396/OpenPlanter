@@ -79,6 +79,7 @@ export interface AppState {
   inputQueue: string[];
   subtaskModel: string | null;
   executeModel: string | null;
+  maxExaAgentCalls: number;
 }
 
 export const appState = new Store<AppState>({
@@ -102,4 +103,5 @@ export const appState = new Store<AppState>({
   inputQueue: [],
   subtaskModel: null,
   executeModel: null,
+  maxExaAgentCalls: 12,
 });

@@ -23,6 +23,8 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::AtomicU32;
+use std::sync::Arc;
 
 use futures::future::{join_all, FutureExt};
 use serde_json::Value;
@@ -35,7 +37,7 @@ use crate::model::{BaseModel, Message, ToolCall};
 use crate::tools::defs::{build_tool_defs_mode, ToolMode};
 use crate::tools::WorkspaceTools;
 
-use super::SolveEmitter;
+use super::{resolve_text_only_turn, SolveEmitter, TEXT_ONLY_NUDGE};
 
 /// Why a recursion level's loop terminated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +82,9 @@ pub struct RecursionCtx<'a> {
     pub provider: &'a str,
     pub system_prompt: &'a str,
     pub artifacts_dir: PathBuf,
+    /// Hard cap counter for `exa_agent` calls, shared by every recursion
+    /// level of this `solve()` run (see `WorkspaceTools::new`'s field doc).
+    pub exa_call_counter: Arc<AtomicU32>,
 }
 
 /// Run one recursion level's full agentic step loop (its own conversation,
@@ -105,6 +110,8 @@ pub fn run_child<'a>(
         let mut steps: u32 = 0;
         let mut tool_counts: BTreeMap<String, u32> = BTreeMap::new();
         let mut last_narration: Option<String> = None;
+        // Has the one-time TEXT_ONLY_NUDGE already been sent for this level's loop?
+        let mut text_only_nudged = false;
 
         if cancel.is_cancelled() {
             return LoopResult {
@@ -118,7 +125,7 @@ pub fn run_child<'a>(
 
         let model: &dyn BaseModel = model_override.as_deref().unwrap_or(ctx.model);
         let tool_defs = build_tool_defs_mode(ctx.provider, mode);
-        let mut tools = WorkspaceTools::new(ctx.config);
+        let mut tools = WorkspaceTools::new(ctx.config, ctx.exa_call_counter.clone());
         let mut messages = vec![
             Message::System {
                 content: ctx.system_prompt.to_string(),
@@ -172,27 +179,51 @@ pub fn run_child<'a>(
 
             if turn.tool_calls.is_empty() {
                 if !turn.text.is_empty() {
-                    ctx.emitter.emit_step(StepEvent {
-                        depth,
-                        step: step as u32,
-                        tool_name: None,
-                        tokens: TokenUsage {
-                            input_tokens: turn.input_tokens,
-                            output_tokens: turn.output_tokens,
-                            cache_creation_input_tokens: turn.cache_creation_input_tokens.unwrap_or(0),
-                            cache_read_input_tokens: turn.cache_read_input_tokens.unwrap_or(0),
-                        },
-                        elapsed_ms: 0,
-                        is_final: true,
-                    });
-                    tools.cleanup();
-                    return LoopResult {
-                        text: turn.text,
-                        kind: LoopKind::Final,
-                        steps,
-                        tool_counts,
-                        last_narration,
-                    };
+                    match resolve_text_only_turn(&turn.text, text_only_nudged) {
+                        Some(final_text) => {
+                            ctx.emitter.emit_step(StepEvent {
+                                depth,
+                                step: step as u32,
+                                tool_name: None,
+                                tokens: TokenUsage {
+                                    input_tokens: turn.input_tokens,
+                                    output_tokens: turn.output_tokens,
+                                    cache_creation_input_tokens: turn.cache_creation_input_tokens.unwrap_or(0),
+                                    cache_read_input_tokens: turn.cache_read_input_tokens.unwrap_or(0),
+                                },
+                                elapsed_ms: 0,
+                                is_final: true,
+                            });
+                            tools.cleanup();
+                            return LoopResult {
+                                text: final_text,
+                                kind: LoopKind::Final,
+                                steps,
+                                tool_counts,
+                                last_narration,
+                            };
+                        }
+                        None => {
+                            text_only_nudged = true;
+                            ctx.emitter.emit_step(StepEvent {
+                                depth,
+                                step: step as u32,
+                                tool_name: None,
+                                tokens: TokenUsage {
+                                    input_tokens: turn.input_tokens,
+                                    output_tokens: turn.output_tokens,
+                                    cache_creation_input_tokens: turn.cache_creation_input_tokens.unwrap_or(0),
+                                    cache_read_input_tokens: turn.cache_read_input_tokens.unwrap_or(0),
+                                },
+                                elapsed_ms: 0,
+                                is_final: false,
+                            });
+                            messages.push(Message::User {
+                                content: TEXT_ONLY_NUDGE.into(),
+                            });
+                            continue;
+                        }
+                    }
                 }
                 messages.push(Message::Tool {
                     tool_call_id: "empty".into(),
@@ -571,6 +602,7 @@ mod tests {
             provider: "openai",
             system_prompt: "sys",
             artifacts_dir: tmp.path().join(".openplanter/artifacts"),
+            exa_call_counter: Arc::new(AtomicU32::new(0)),
         };
         let tc = ToolCall {
             id: "t0".into(),
@@ -598,9 +630,9 @@ mod tests {
                     ("subtask", serde_json::json!({"objective": "task A"})),
                     ("subtask", serde_json::json!({"objective": "task B"})),
                 ]),
-                final_turn("done A"),
-                final_turn("done B"),
-                final_turn("wrap up"),
+                final_turn("done A\nDONE"),
+                final_turn("done B\nDONE"),
+                final_turn("wrap up\nDONE"),
             ],
             call_count: AtomicUsize::new(0),
             delay_ms: 120,
@@ -613,6 +645,7 @@ mod tests {
             provider: "openai",
             system_prompt: "sys",
             artifacts_dir: tmp.path().join(".openplanter/artifacts"),
+            exa_call_counter: Arc::new(AtomicU32::new(0)),
         };
 
         let start = std::time::Instant::now();
@@ -652,7 +685,7 @@ mod tests {
                 _cancel: &CancellationToken,
             ) -> anyhow::Result<crate::model::ModelTurn> {
                 self.seen.lock().unwrap().push(tools.to_vec());
-                Ok(final_turn("leaf done"))
+                Ok(final_turn("leaf done\nDONE"))
             }
             fn model_name(&self) -> &str {
                 "mock"
@@ -671,6 +704,7 @@ mod tests {
             provider: "openai",
             system_prompt: "sys",
             artifacts_dir: tmp.path().join(".openplanter/artifacts"),
+            exa_call_counter: Arc::new(AtomicU32::new(0)),
         };
         let tc = ToolCall {
             id: "t0".into(),
@@ -762,7 +796,7 @@ mod tests {
             script: vec![
                 tool_call_turn(vec![("read_file", serde_json::json!({"path": "a.txt"}))]),
                 tool_call_turn(vec![("read_file", serde_json::json!({"path": "b.txt"}))]),
-                final_turn("done"),
+                final_turn("task finished\nDONE"),
             ],
             call_count: AtomicUsize::new(0),
             delay_ms: 0,
@@ -775,10 +809,11 @@ mod tests {
             provider: "openai",
             system_prompt: "sys",
             artifacts_dir: tmp.path().join(".openplanter/artifacts"),
+            exa_call_counter: Arc::new(AtomicU32::new(0)),
         };
         let result = run_child(&ctx, None, "objective".into(), 0, ToolMode::Recursive, CancellationToken::new()).await;
         assert_eq!(result.kind, LoopKind::Final);
-        assert_eq!(result.text, "done");
+        assert_eq!(result.text, "task finished");
         assert_eq!(result.steps, 3);
         assert_eq!(result.tool_counts.get("read_file"), Some(&2));
     }
@@ -803,7 +838,7 @@ mod tests {
         cfg.subtask_model = Some("claude-haiku-4-5".into());
         cfg.anthropic_api_key = None; // force build_model to fail
         let model = MockModel {
-            script: vec![final_turn("handled by parent mock model")],
+            script: vec![final_turn("handled by parent mock model\nDONE")],
             call_count: AtomicUsize::new(0),
             delay_ms: 0,
         };
@@ -815,6 +850,7 @@ mod tests {
             provider: "openai",
             system_prompt: "sys",
             artifacts_dir: tmp.path().join(".openplanter/artifacts"),
+            exa_call_counter: Arc::new(AtomicU32::new(0)),
         };
         let tc = ToolCall {
             id: "t0".into(),
@@ -847,6 +883,7 @@ mod tests {
             provider: "openai",
             system_prompt: "sys",
             artifacts_dir: tmp.path().join(".openplanter/artifacts"),
+            exa_call_counter: Arc::new(AtomicU32::new(0)),
         };
         let tc = ToolCall {
             id: "t0".into(),
@@ -856,5 +893,102 @@ mod tests {
         let observation = spawn_delegation(&ctx, "mock".into(), tc, 0, CancellationToken::new()).await;
         assert!(observation.contains("not available in flat mode"));
         assert_eq!(model.call_count.load(Ordering::SeqCst), 0);
+    }
+
+    // ── DONE completion protocol (run_child) ──
+
+    #[tokio::test]
+    async fn test_run_child_done_marker_finalizes_immediately_and_strips_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = test_config(tmp.path());
+        let model = MockModel {
+            script: vec![final_turn("All findings written to disk.\nDONE")],
+            call_count: AtomicUsize::new(0),
+            delay_ms: 0,
+        };
+        let emitter = NullEmitter;
+        let ctx = RecursionCtx {
+            config: &cfg,
+            emitter: &emitter,
+            model: &model,
+            provider: "openai",
+            system_prompt: "sys",
+            artifacts_dir: tmp.path().join(".openplanter/artifacts"),
+            exa_call_counter: Arc::new(AtomicU32::new(0)),
+        };
+        let result = run_child(&ctx, None, "objective".into(), 0, ToolMode::Recursive, CancellationToken::new()).await;
+        assert_eq!(result.kind, LoopKind::Final);
+        assert_eq!(result.text, "All findings written to disk.");
+        assert_eq!(result.steps, 1, "DONE marker must finalize on the very first turn");
+        assert_eq!(model.call_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_run_child_text_only_without_done_nudges_once_then_finalizes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = test_config(tmp.path());
+        // Same text-only turn every call (MockModel repeats the last script
+        // entry once exhausted) — must nudge on the first occurrence, then
+        // finalize (unstripped, since there's still no DONE) on the second.
+        let model = MockModel {
+            script: vec![final_turn("Now I have sufficient evidence. Let me write the files.")],
+            call_count: AtomicUsize::new(0),
+            delay_ms: 0,
+        };
+        let emitter = NullEmitter;
+        let ctx = RecursionCtx {
+            config: &cfg,
+            emitter: &emitter,
+            model: &model,
+            provider: "openai",
+            system_prompt: "sys",
+            artifacts_dir: tmp.path().join(".openplanter/artifacts"),
+            exa_call_counter: Arc::new(AtomicU32::new(0)),
+        };
+        let result = run_child(&ctx, None, "objective".into(), 0, ToolMode::Recursive, CancellationToken::new()).await;
+        assert_eq!(
+            model.call_count.load(Ordering::SeqCst),
+            2,
+            "expected exactly one nudge turn followed by one finalizing turn"
+        );
+        assert_eq!(result.kind, LoopKind::Final);
+        assert_eq!(
+            result.text,
+            "Now I have sufficient evidence. Let me write the files.",
+            "second text-only turn (after the one-time nudge) must finalize even without DONE"
+        );
+        assert_eq!(result.steps, 2);
+    }
+
+    #[tokio::test]
+    async fn test_run_child_second_distinct_text_only_turn_after_nudge_finalizes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = test_config(tmp.path());
+        // Two DIFFERENT text-only turns in sequence, neither ending in DONE:
+        // turn 1 must nudge (not finalize); turn 2 must finalize (the nudge
+        // already fired once this loop) with its own text, unstripped.
+        let model = MockModel {
+            script: vec![
+                final_turn("thinking out loud, not done yet"),
+                final_turn("okay, wrapping up now"),
+            ],
+            call_count: AtomicUsize::new(0),
+            delay_ms: 0,
+        };
+        let emitter = NullEmitter;
+        let ctx = RecursionCtx {
+            config: &cfg,
+            emitter: &emitter,
+            model: &model,
+            provider: "openai",
+            system_prompt: "sys",
+            artifacts_dir: tmp.path().join(".openplanter/artifacts"),
+            exa_call_counter: Arc::new(AtomicU32::new(0)),
+        };
+        let result = run_child(&ctx, None, "objective".into(), 0, ToolMode::Recursive, CancellationToken::new()).await;
+        assert_eq!(result.kind, LoopKind::Final);
+        assert_eq!(result.text, "okay, wrapping up now");
+        assert_eq!(result.steps, 2);
+        assert_eq!(model.call_count.load(Ordering::SeqCst), 2);
     }
 }
