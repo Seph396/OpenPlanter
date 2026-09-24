@@ -332,13 +332,17 @@ pub async fn solve(
             tool_calls: tool_calls_opt,
         });
 
-        // No tool calls → final answer
-        if turn.tool_calls.is_empty() {
-            let tool_name = None;
+        // No tool calls + text present = final answer (matches
+        // agent/engine.py::_solve_recursive: "No tool calls + text present =
+        // final answer", engine.py:442-463 — the system prompt instructs the
+        // model to "stop calling tools and respond with your final answer as
+        // plain text" when done, so Python treats this as final unconditionally;
+        // there is no marker/nudge mechanism gating it).
+        if turn.tool_calls.is_empty() && !turn.text.is_empty() {
             emitter.emit_step(StepEvent {
                 depth: 0,
                 step: step as u32,
-                tool_name,
+                tool_name: None,
                 tokens: TokenUsage {
                     input_tokens: turn.input_tokens,
                     output_tokens: turn.output_tokens,
@@ -353,6 +357,33 @@ pub async fn solve(
             // Wait for in-flight curators before exiting
             finish_curators(&mut curator_handles, &mut curator_rx, &mut messages, emitter).await;
             return;
+        }
+
+        // No tool calls AND no text = unexpected empty response. Python
+        // (engine.py:465-474) and the child loop (subagent.rs) both nudge
+        // here rather than ending the run; depth-0 previously fell into the
+        // "no tool calls" branch above and returned an empty final answer,
+        // silently ending a run on a transient/malformed empty turn. Nudge
+        // and continue instead, matching both references.
+        if turn.tool_calls.is_empty() {
+            emitter.emit_step(StepEvent {
+                depth: 0,
+                step: step as u32,
+                tool_name: None,
+                tokens: TokenUsage {
+                    input_tokens: turn.input_tokens,
+                    output_tokens: turn.output_tokens,
+                    cache_creation_input_tokens: turn.cache_creation_input_tokens.unwrap_or(0),
+                    cache_read_input_tokens: turn.cache_read_input_tokens.unwrap_or(0),
+                },
+                elapsed_ms: step_start.elapsed().as_millis() as u64,
+                is_final: false,
+            });
+            messages.push(Message::Tool {
+                tool_call_id: "empty".into(),
+                content: "No tool calls and no text in response. Please use a tool or provide a final answer.".into(),
+            });
+            continue;
         }
 
         // Execute tool calls: subtask/execute fan out concurrently (real

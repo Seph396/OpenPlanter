@@ -19,6 +19,7 @@
 //   Rust port exposes all four whenever `config.recursive` is true, per
 //   explicit instruction in this task's brief.
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -46,10 +47,29 @@ pub enum LoopKind {
 }
 
 /// Outcome of one `run_child` invocation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct LoopResult {
     pub text: String,
     pub kind: LoopKind,
+    /// Number of model-turn steps this level actually took (>=1 unless
+    /// cancelled before the first turn).
+    pub steps: u32,
+    /// Count of each tool name invoked at this level (not recursing into
+    /// grandchildren's own tool calls). Includes `subtask`/`execute` calls
+    /// themselves, but not what those children did internally.
+    pub tool_counts: BTreeMap<String, u32>,
+    /// The model's text on the step immediately before the final one, when
+    /// that step also carried tool calls (i.e. the model narrated an
+    /// intention while still acting). `None` if there was no such text, or
+    /// if the run ended on the very first step. Distinct from `text`, which
+    /// is the actual final answer (or budget/cancel/error message).
+    pub last_narration: Option<String>,
+}
+
+impl Default for LoopKind {
+    fn default() -> Self {
+        LoopKind::BudgetExhausted
+    }
 }
 
 /// Immutable context shared by every recursion level of one `solve()` call.
@@ -82,10 +102,17 @@ pub fn run_child<'a>(
     cancel: CancellationToken,
 ) -> Pin<Box<dyn Future<Output = LoopResult> + Send + 'a>> {
     Box::pin(async move {
+        let mut steps: u32 = 0;
+        let mut tool_counts: BTreeMap<String, u32> = BTreeMap::new();
+        let mut last_narration: Option<String> = None;
+
         if cancel.is_cancelled() {
             return LoopResult {
                 text: "Task cancelled.".into(),
                 kind: LoopKind::Cancelled,
+                steps,
+                tool_counts,
+                last_narration,
             };
         }
 
@@ -109,6 +136,9 @@ pub fn run_child<'a>(
                 return LoopResult {
                     text: "Task cancelled.".into(),
                     kind: LoopKind::Cancelled,
+                    steps,
+                    tool_counts,
+                    last_narration,
                 };
             }
 
@@ -122,9 +152,13 @@ pub fn run_child<'a>(
                     return LoopResult {
                         text: format!("Model error at depth {depth}, step {step}: {e}"),
                         kind: LoopKind::ModelError,
+                        steps,
+                        tool_counts,
+                        last_narration,
                     };
                 }
             };
+            steps += 1;
 
             let tool_calls_opt = if turn.tool_calls.is_empty() {
                 None
@@ -155,6 +189,9 @@ pub fn run_child<'a>(
                     return LoopResult {
                         text: turn.text,
                         kind: LoopKind::Final,
+                        steps,
+                        tool_counts,
+                        last_narration,
                     };
                 }
                 messages.push(Message::Tool {
@@ -162,6 +199,13 @@ pub fn run_child<'a>(
                     content: "No tool calls and no text in response. Please use a tool or provide a final answer.".into(),
                 });
                 continue;
+            }
+
+            for tc in &turn.tool_calls {
+                *tool_counts.entry(tc.name.clone()).or_insert(0) += 1;
+            }
+            if !turn.text.is_empty() {
+                last_narration = Some(turn.text.clone());
             }
 
             // Sequential tools run in place; subtask/execute fan out concurrently.
@@ -222,6 +266,9 @@ pub fn run_child<'a>(
                  Please try with a more specific task, higher step budget, or deeper recursion."
             ),
             kind: LoopKind::BudgetExhausted,
+            steps,
+            tool_counts,
+            last_narration,
         }
     })
 }
@@ -326,7 +373,7 @@ pub fn spawn_delegation<'a>(
             .emit_trace(&format!("[d{depth}] >> {}: {}", tc.name, objective));
 
         let result = run_child(ctx, model_override, objective.clone(), depth + 1, mode, cancel).await;
-        write_artifact(&ctx.artifacts_dir, depth + 1, &tc.name, &objective, &result.text);
+        write_artifact(&ctx.artifacts_dir, depth + 1, &tc.name, &objective, &result);
 
         format!("{label} result for '{objective}':\n{}", result.text)
     })
@@ -336,17 +383,26 @@ pub fn spawn_delegation<'a>(
 // Artifact storage — {workspace}/{session_root_dir}/artifacts/{id}.jsonl
 // ---------------------------------------------------------------------
 
-fn write_artifact(dir: &Path, depth: u32, kind: &str, objective: &str, result: &str) {
+fn write_artifact(dir: &Path, depth: u32, kind: &str, objective: &str, result: &LoopResult) {
     let artifact_id = format!("d{depth}-{}", uuid::Uuid::new_v4().simple());
     if std::fs::create_dir_all(dir).is_err() {
         return;
     }
+    // `result` is the final answer text (kept under its original key name for
+    // backward compatibility with existing artifact readers/tests). `steps`,
+    // `tool_counts`, and `last_narration` are new — a reader parsing an older
+    // artifact file simply won't see them; nothing here requires a Rust
+    // struct with #[serde(default)] since these records are write-only JSON
+    // values, not deserialized anywhere in this codebase (verified via grep).
     let record = serde_json::json!({
         "artifact_id": artifact_id,
         "kind": kind,
         "depth": depth,
         "objective": objective,
-        "result": result,
+        "result": result.text,
+        "steps": result.steps,
+        "tool_counts": result.tool_counts,
+        "last_narration": result.last_narration,
     });
     let path = dir.join(format!("{artifact_id}.jsonl"));
     let _ = std::fs::write(&path, format!("{}\n", record));
@@ -639,7 +695,14 @@ mod tests {
     fn test_list_and_read_artifact_roundtrip() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("artifacts");
-        write_artifact(&dir, 1, "subtask", "find the thing", "the thing was found");
+        let result = LoopResult {
+            text: "the thing was found".into(),
+            kind: LoopKind::Final,
+            steps: 3,
+            tool_counts: BTreeMap::from([("read_file".to_string(), 2)]),
+            last_narration: Some("Reading the file now.".into()),
+        };
+        write_artifact(&dir, 1, "subtask", "find the thing", &result);
 
         let listing = list_artifacts(&dir);
         assert!(listing.starts_with("Artifacts (1):"));
@@ -658,6 +721,66 @@ mod tests {
 
         let read = read_artifact(&dir, &id, 0, 10);
         assert!(read.contains("the thing was found"));
+    }
+
+    #[test]
+    fn test_write_artifact_records_steps_tool_counts_and_narration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("artifacts");
+        let result = LoopResult {
+            text: "final answer text".into(),
+            kind: LoopKind::Final,
+            steps: 4,
+            tool_counts: BTreeMap::from([
+                ("read_file".to_string(), 2),
+                ("write_file".to_string(), 1),
+            ]),
+            last_narration: Some("Now I have sufficient evidence. Let me write the files.".into()),
+        };
+        write_artifact(&dir, 1, "subtask", "obj", &result);
+
+        let mut entries = std::fs::read_dir(&dir).unwrap();
+        let path = entries.next().unwrap().unwrap().path();
+        let content = std::fs::read_to_string(&path).unwrap();
+        let parsed: Value = serde_json::from_str(content.trim()).unwrap();
+
+        assert_eq!(parsed["result"], "final answer text");
+        assert_eq!(parsed["steps"], 4);
+        assert_eq!(parsed["tool_counts"]["read_file"], 2);
+        assert_eq!(parsed["tool_counts"]["write_file"], 1);
+        assert_eq!(
+            parsed["last_narration"],
+            "Now I have sufficient evidence. Let me write the files."
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_child_tracks_steps_and_tool_counts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = test_config(tmp.path());
+        let model = MockModel {
+            script: vec![
+                tool_call_turn(vec![("read_file", serde_json::json!({"path": "a.txt"}))]),
+                tool_call_turn(vec![("read_file", serde_json::json!({"path": "b.txt"}))]),
+                final_turn("done"),
+            ],
+            call_count: AtomicUsize::new(0),
+            delay_ms: 0,
+        };
+        let emitter = NullEmitter;
+        let ctx = RecursionCtx {
+            config: &cfg,
+            emitter: &emitter,
+            model: &model,
+            provider: "openai",
+            system_prompt: "sys",
+            artifacts_dir: tmp.path().join(".openplanter/artifacts"),
+        };
+        let result = run_child(&ctx, None, "objective".into(), 0, ToolMode::Recursive, CancellationToken::new()).await;
+        assert_eq!(result.kind, LoopKind::Final);
+        assert_eq!(result.text, "done");
+        assert_eq!(result.steps, 3);
+        assert_eq!(result.tool_counts.get("read_file"), Some(&2));
     }
 
     #[test]

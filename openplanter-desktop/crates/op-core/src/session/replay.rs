@@ -25,6 +25,14 @@ pub struct ReplayEntry {
     pub step_tokens_in: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub step_tokens_out: Option<u64>,
+    /// Prompt-cache tokens written this step (Anthropic only; from
+    /// `TokenUsage::cache_creation_input_tokens`, added 9cab1ef).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_cache_creation: Option<u64>,
+    /// Prompt-cache tokens read this step (Anthropic only; from
+    /// `TokenUsage::cache_read_input_tokens`, added 9cab1ef).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_cache_read: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub step_elapsed: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -120,6 +128,8 @@ mod tests {
             step_number: None,
             step_tokens_in: None,
             step_tokens_out: None,
+            step_cache_creation: None,
+            step_cache_read: None,
             step_elapsed: None,
             step_model_preview: None,
             step_tool_calls: None,
@@ -143,6 +153,8 @@ mod tests {
                 step_number: None,
                 step_tokens_in: None,
                 step_tokens_out: None,
+                step_cache_creation: None,
+                step_cache_read: None,
                 step_elapsed: None,
                 step_model_preview: None,
                 step_tool_calls: None,
@@ -177,6 +189,8 @@ mod tests {
             step_number: Some(1),
             step_tokens_in: Some(12300),
             step_tokens_out: Some(2100),
+            step_cache_creation: Some(300),
+            step_cache_read: Some(9500),
             step_elapsed: Some(5000),
             step_model_preview: Some("The analysis shows...".into()),
             step_tool_calls: Some(vec![
@@ -194,6 +208,8 @@ mod tests {
         assert_eq!(entries[0].role, "step-summary");
         assert_eq!(entries[0].step_number, Some(1));
         assert_eq!(entries[0].step_tokens_in, Some(12300));
+        assert_eq!(entries[0].step_cache_creation, Some(300));
+        assert_eq!(entries[0].step_cache_read, Some(9500));
         let tools = entries[0].step_tool_calls.as_ref().unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "read_file");
@@ -215,6 +231,8 @@ mod tests {
                 step_number: None,
                 step_tokens_in: None,
                 step_tokens_out: None,
+                step_cache_creation: None,
+                step_cache_read: None,
                 step_elapsed: None,
                 step_model_preview: None,
                 step_tool_calls: None,
@@ -229,6 +247,8 @@ mod tests {
                 step_number: None,
                 step_tokens_in: None,
                 step_tokens_out: None,
+                step_cache_creation: None,
+                step_cache_read: None,
                 step_elapsed: None,
                 step_model_preview: None,
                 step_tool_calls: None,
@@ -256,6 +276,8 @@ mod tests {
             step_number: None,
             step_tokens_in: None,
             step_tokens_out: None,
+            step_cache_creation: None,
+            step_cache_read: None,
             step_elapsed: None,
             step_model_preview: None,
             step_tool_calls: None,
@@ -279,6 +301,8 @@ mod tests {
             step_number: None,
             step_tokens_in: None,
             step_tokens_out: None,
+            step_cache_creation: None,
+            step_cache_read: None,
             step_elapsed: None,
             step_model_preview: None,
             step_tool_calls: None,
@@ -289,5 +313,30 @@ mod tests {
         assert!(!content.contains("tool_name"));
         assert!(!content.contains("step_number"));
         assert!(!content.contains("step_tool_calls"));
+    }
+
+    /// Old replay.jsonl rows written before `step_cache_creation`/
+    /// `step_cache_read` existed must still deserialize (the `#[serde(default)]`
+    /// on both fields is load-bearing here).
+    #[tokio::test]
+    async fn test_deserializes_pre_cache_field_rows() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("replay.jsonl");
+        let old_row = serde_json::json!({
+            "seq": 1,
+            "timestamp": "2026-01-01T00:00:00Z",
+            "role": "step-summary",
+            "content": "",
+            "step_number": 1,
+            "step_tokens_in": 100,
+            "step_tokens_out": 50
+        });
+        fs::write(&path, format!("{}\n", old_row)).await.unwrap();
+
+        let entries = ReplayLogger::read_all(tmp.path()).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].step_tokens_in, Some(100));
+        assert_eq!(entries[0].step_cache_creation, None);
+        assert_eq!(entries[0].step_cache_read, None);
     }
 }

@@ -39,6 +39,8 @@ pub async fn solve(
         step_number: None,
         step_tokens_in: None,
         step_tokens_out: None,
+        step_cache_creation: None,
+        step_cache_read: None,
         step_elapsed: None,
         step_model_preview: None,
         step_tool_calls: None,
