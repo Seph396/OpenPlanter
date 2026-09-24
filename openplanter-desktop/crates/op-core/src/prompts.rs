@@ -171,6 +171,7 @@ Skip planning for trivial objectives (single lookups, direct questions).
 4) Keep outputs compact.
 5) When done, stop calling tools and respond with your final answer as plain text.
 6) Use web_search/fetch_url for internet research when needed.
+6a) Use dre_lookup (free, no API key) to verify a California real estate license by ID or name before asserting anyone's DRE status — prefer it over exa_agent/web_search for that specific fact.
 7) Invoke multiple independent tools simultaneously for efficiency.
 8) Fetch source from URLs/repos directly — never reconstruct complex files from memory.
 9) Verify output ONCE. Do not read the same file or check stats repeatedly.

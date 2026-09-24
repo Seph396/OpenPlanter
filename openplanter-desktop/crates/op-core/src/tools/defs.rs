@@ -243,6 +243,30 @@ fn mvp_tool_defs() -> Vec<ToolDef> {
                 "additionalProperties": false
             }),
         },
+        // ── Verification ──
+        ToolDef {
+            name: "dre_lookup",
+            description: "Look up a California DRE real estate license by license number or by name 'Last, First'. Free, authoritative, use before asserting anyone's license status.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "license_id": {
+                        "type": "string",
+                        "description": "DRE license ID to look up directly (e.g. '00000101'). Mutually exclusive with name."
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Licensee name to search, formatted 'Last, First' (e.g. 'Doe, John'). Mutually exclusive with license_id."
+                    },
+                    "city": {
+                        "type": "string",
+                        "description": "Optional city/state filter for name search."
+                    }
+                },
+                "required": [],
+                "additionalProperties": false
+            }),
+        },
         // ── Patching ──
         ToolDef {
             name: "apply_patch",
@@ -727,7 +751,7 @@ mod tests {
             .iter()
             .map(|t| t["function"]["name"].as_str().unwrap().to_string())
             .collect();
-        assert_eq!(names.len(), 15, "flat mode should have exactly the 15 base tools");
+        assert_eq!(names.len(), 16, "flat mode should have exactly the 16 base tools");
         for delegation in ["subtask", "execute", "list_artifacts", "read_artifact"] {
             assert!(!names.contains(&delegation.to_string()), "flat mode must not include {delegation}");
         }
@@ -740,7 +764,7 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap().to_string())
             .collect();
-        assert_eq!(names.len(), 19);
+        assert_eq!(names.len(), 20);
         for delegation in ["subtask", "execute", "list_artifacts", "read_artifact"] {
             assert!(names.contains(&delegation.to_string()), "recursive mode must include {delegation}");
         }
@@ -753,7 +777,7 @@ mod tests {
             .iter()
             .map(|t| t["function"]["name"].as_str().unwrap().to_string())
             .collect();
-        assert_eq!(names.len(), 15, "execute child should only have the base tools");
+        assert_eq!(names.len(), 16, "execute child should only have the base tools");
         for delegation in ["subtask", "execute", "list_artifacts", "read_artifact"] {
             assert!(!names.contains(&delegation.to_string()), "execute child must not include {delegation}");
         }

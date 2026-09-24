@@ -4,6 +4,7 @@
 /// (files-read set, background jobs) and routes tool calls to the appropriate module.
 
 pub mod defs;
+pub mod dre;
 pub mod filesystem;
 pub mod shell;
 pub mod web;
@@ -235,6 +236,14 @@ impl WorkspaceTools {
                     self.command_timeout_sec,
                 )
                 .await
+            }
+
+            // Verification
+            "dre_lookup" => {
+                let license_id = args.get("license_id").and_then(|v| v.as_str());
+                let name = args.get("name").and_then(|v| v.as_str());
+                let city = args.get("city").and_then(|v| v.as_str());
+                dre::dre_lookup(license_id, name, city).await
             }
 
             // Patching
