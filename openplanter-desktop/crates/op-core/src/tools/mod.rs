@@ -177,6 +177,25 @@ impl WorkspaceTools {
                 )
                 .await
             }
+            "exa_agent" => {
+                let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+                let data_sources: Option<Vec<String>> = args.get("data_sources").and_then(|v| v.as_array()).map(|arr| {
+                    arr.iter().filter_map(|v| v.as_str().map(String::from)).collect()
+                });
+                let output_schema = args.get("output_schema");
+                let effort = args.get("effort").and_then(|v| v.as_str());
+                web::exa_agent(
+                    self.exa_api_key.as_deref(),
+                    &self.exa_base_url,
+                    query,
+                    data_sources.as_deref(),
+                    output_schema,
+                    effort,
+                    self.max_observation_chars,
+                    self.command_timeout_sec,
+                )
+                .await
+            }
             "fetch_url" => {
                 let urls: Vec<String> = args
                     .get("urls")

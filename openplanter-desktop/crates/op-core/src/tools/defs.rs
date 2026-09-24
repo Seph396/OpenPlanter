@@ -199,6 +199,35 @@ fn mvp_tool_defs() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
+            name: "exa_agent",
+            description: "Run a premium Exa Connect research agent for record lookups the free web can't reliably answer — business officers, UCC liens, litigation history, corporate registries — optionally through specific data providers (e.g. 'baselayer'). This costs money per call; prefer web_search for general queries and only use exa_agent when you need a structured, cited, provider-backed lookup.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Natural-language research query or instructions for the agent."
+                    },
+                    "data_sources": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional Exa Connect provider names to enable (e.g. 'baselayer', 'fiber', 'similarweb')."
+                    },
+                    "output_schema": {
+                        "type": "object",
+                        "description": "Optional JSON Schema describing the desired structured output shape."
+                    },
+                    "effort": {
+                        "type": "string",
+                        "enum": ["minimal", "low", "medium", "high", "xhigh", "auto", "max"],
+                        "description": "Optional cost/reasoning effort for the run. 'auto' lets Exa choose."
+                    }
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDef {
             name: "fetch_url",
             description: "Fetch and return the text content of one or more URLs.",
             parameters: json!({
@@ -292,6 +321,142 @@ fn mvp_tool_defs() -> Vec<ToolDef> {
             }),
         },
     ]
+}
+
+/// Delegation tool definitions: subtask, execute, list_artifacts, read_artifact.
+///
+/// Mirrors `agent/tool_defs.py::TOOL_DEFINITIONS` entries for these four names.
+/// Kept separate from `mvp_tool_defs()` because their availability depends on
+/// `config.recursive` and on whether the current agent is an `execute` leaf.
+fn delegation_tool_defs() -> Vec<ToolDef> {
+    vec![
+        ToolDef {
+            name: "subtask",
+            description: "Spawn a recursive sub-agent to solve a smaller sub-problem. The result is returned as an observation.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "objective": {
+                        "type": "string",
+                        "description": "Clear objective for the sub-agent to accomplish."
+                    },
+                    "acceptance_criteria": {
+                        "type": "string",
+                        "description": "Acceptance criteria for judging the subtask result. Be specific and verifiable."
+                    }
+                },
+                "required": ["objective"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDef {
+            name: "execute",
+            description: "Hand an atomic sub-problem to a leaf executor agent with full tool access. Use this when the sub-problem requires no further decomposition and can be solved directly (e.g. write a file, run tests, apply a patch). The executor has no subtask or execute tools — it must solve the objective in one pass.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "objective": {
+                        "type": "string",
+                        "description": "Clear, specific objective for the executor to accomplish."
+                    },
+                    "acceptance_criteria": {
+                        "type": "string",
+                        "description": "Acceptance criteria for judging the executor result. Be specific and verifiable."
+                    }
+                },
+                "required": ["objective"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDef {
+            name: "list_artifacts",
+            description: "List artifacts from previous subagent runs. Returns ID, objective, and result summary for each.",
+            parameters: json!({
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": false
+            }),
+        },
+        ToolDef {
+            name: "read_artifact",
+            description: "Read a previous subagent's result artifact by ID.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "artifact_id": {
+                        "type": "string",
+                        "description": "Artifact ID from list_artifacts."
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "Start line (0-indexed). Default 0."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max lines to return. Default 100."
+                    }
+                },
+                "required": ["artifact_id"],
+                "additionalProperties": false
+            }),
+        },
+    ]
+}
+
+/// Which delegation tools (if any) should be exposed to the model at this
+/// point in the recursion tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolMode {
+    /// `config.recursive == false` — no delegation tools at all.
+    Flat,
+    /// Normal recursive depth (top level or inside a `subtask`) — full
+    /// delegation tool set (subtask, execute, list_artifacts, read_artifact).
+    Recursive,
+    /// Inside an `execute` leaf — delegation tools removed so the executor
+    /// must solve the objective directly, in one pass.
+    ExecuteChild,
+}
+
+fn tool_defs_for_mode(mode: ToolMode) -> Vec<ToolDef> {
+    let mut defs = mvp_tool_defs();
+    if mode == ToolMode::Recursive {
+        defs.extend(delegation_tool_defs());
+    }
+    defs
+}
+
+/// Build tool definitions for the given provider and delegation mode.
+pub fn build_tool_defs_mode(provider: &str, mode: ToolMode) -> Vec<Value> {
+    let defs = tool_defs_for_mode(mode);
+    match provider {
+        "anthropic" => defs
+            .into_iter()
+            .map(|def| {
+                json!({
+                    "name": def.name,
+                    "description": def.description,
+                    "input_schema": def.parameters
+                })
+            })
+            .collect(),
+        _ => defs
+            .into_iter()
+            .map(|def| {
+                let mut params = def.parameters;
+                strict_fixup(&mut params);
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": def.name,
+                        "description": def.description,
+                        "parameters": params,
+                        "strict": true
+                    }
+                })
+            })
+            .collect(),
+    }
 }
 
 /// For OpenAI strict mode: make all properties required, wrapping optional ones
@@ -553,6 +718,45 @@ mod tests {
         assert!(!names.contains(&"run_shell_bg".to_string()));
         assert!(!names.contains(&"check_shell_bg".to_string()));
         assert!(!names.contains(&"kill_shell_bg".to_string()));
+    }
+
+    #[test]
+    fn test_tool_defs_mode_flat_excludes_delegation() {
+        let tools = build_tool_defs_mode("openai", ToolMode::Flat);
+        let names: Vec<String> = tools
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(names.len(), 15, "flat mode should have exactly the 15 base tools");
+        for delegation in ["subtask", "execute", "list_artifacts", "read_artifact"] {
+            assert!(!names.contains(&delegation.to_string()), "flat mode must not include {delegation}");
+        }
+    }
+
+    #[test]
+    fn test_tool_defs_mode_recursive_includes_all_delegation() {
+        let tools = build_tool_defs_mode("anthropic", ToolMode::Recursive);
+        let names: Vec<String> = tools
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(names.len(), 19);
+        for delegation in ["subtask", "execute", "list_artifacts", "read_artifact"] {
+            assert!(names.contains(&delegation.to_string()), "recursive mode must include {delegation}");
+        }
+    }
+
+    #[test]
+    fn test_tool_defs_mode_execute_child_excludes_delegation() {
+        let tools = build_tool_defs_mode("openai", ToolMode::ExecuteChild);
+        let names: Vec<String> = tools
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(names.len(), 15, "execute child should only have the base tools");
+        for delegation in ["subtask", "execute", "list_artifacts", "read_artifact"] {
+            assert!(!names.contains(&delegation.to_string()), "execute child must not include {delegation}");
+        }
     }
 
     #[test]

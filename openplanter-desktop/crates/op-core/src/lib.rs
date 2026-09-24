@@ -9,3 +9,4 @@ pub mod engine;
 pub mod tools;
 pub mod session;
 pub mod wiki;
+pub mod workspace;

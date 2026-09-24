@@ -35,9 +35,25 @@ impl AnthropicModel {
         }
     }
 
-    fn is_opus_46(&self) -> bool {
+    /// Whether this model uses the newer "adaptive" thinking format
+    /// (`thinking: {type: "adaptive"}` + `output_config: {effort}`) instead of
+    /// the legacy `thinking: {type: "enabled", budget_tokens}` format.
+    ///
+    /// Claude Opus 4.6 and every Claude 5-generation model (opus/sonnet/haiku/fable
+    /// with a `-5` version segment, e.g. `claude-opus-5`, `claude-sonnet-5`,
+    /// `claude-fable-5-1`) use adaptive thinking; older models reject it.
+    fn uses_adaptive_thinking(&self) -> bool {
         let lower = self.model.to_lowercase();
-        lower.contains("opus-4-6") || lower.contains("opus-4.6")
+        if lower.contains("opus-4-6") || lower.contains("opus-4.6") {
+            return true;
+        }
+        for family in ["opus", "sonnet", "haiku", "fable"] {
+            let needle = format!("claude-{family}-5");
+            if lower.contains(&needle) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Extract the system prompt from messages (Anthropic uses a top-level `system` field).
@@ -120,6 +136,43 @@ impl AnthropicModel {
         result
     }
 
+    /// Mark the last content block of the last user/tool-result message as a
+    /// cache breakpoint, so the growing conversation prefix is cached step to
+    /// step. Converts a plain-string `content` field to a content-block array
+    /// if needed (Anthropic requires blocks to attach `cache_control`).
+    fn add_cache_control_to_last_message(messages: &mut [serde_json::Value]) {
+        let Some(last_msg) = messages.last_mut() else {
+            return;
+        };
+        if last_msg.get("role").and_then(|r| r.as_str()) != Some("user") {
+            return;
+        }
+        let Some(content) = last_msg.get_mut("content") else {
+            return;
+        };
+
+        if let Some(text) = content.as_str() {
+            let text = text.to_string();
+            *content = serde_json::json!([{
+                "type": "text",
+                "text": text,
+                "cache_control": {"type": "ephemeral"},
+            }]);
+            return;
+        }
+
+        if let Some(arr) = content.as_array_mut() {
+            if let Some(last_block) = arr.last_mut() {
+                if let Some(obj) = last_block.as_object_mut() {
+                    obj.insert(
+                        "cache_control".to_string(),
+                        serde_json::json!({"type": "ephemeral"}),
+                    );
+                }
+            }
+        }
+    }
+
     fn build_payload(
         &self,
         messages: &[Message],
@@ -132,23 +185,41 @@ impl AnthropicModel {
             .unwrap_or_default();
         let use_thinking = matches!(effort.as_str(), "low" | "medium" | "high");
 
+        let mut converted_messages = Self::convert_messages(messages);
+        Self::add_cache_control_to_last_message(&mut converted_messages);
+
         let mut payload = serde_json::json!({
             "model": self.model,
             "max_tokens": self.max_tokens,
-            "messages": Self::convert_messages(messages),
+            "messages": converted_messages,
             "stream": true,
         });
 
         if let Some(system) = Self::extract_system(messages) {
-            payload["system"] = serde_json::json!(system);
+            // System must be an array of content blocks (not a plain string) so we
+            // can mark it as a cache breakpoint.
+            payload["system"] = serde_json::json!([{
+                "type": "text",
+                "text": system,
+                "cache_control": {"type": "ephemeral"},
+            }]);
         }
 
         if !tools.is_empty() {
-            payload["tools"] = serde_json::Value::Array(tools.to_vec());
+            let mut tools_vec = tools.to_vec();
+            if let Some(last_tool) = tools_vec.last_mut() {
+                if let Some(obj) = last_tool.as_object_mut() {
+                    obj.insert(
+                        "cache_control".to_string(),
+                        serde_json::json!({"type": "ephemeral"}),
+                    );
+                }
+            }
+            payload["tools"] = serde_json::Value::Array(tools_vec);
         }
 
         if use_thinking {
-            if self.is_opus_46() {
+            if self.uses_adaptive_thinking() {
                 payload["thinking"] = serde_json::json!({"type": "adaptive"});
                 payload["output_config"] = serde_json::json!({"effort": effort});
             } else {
@@ -212,6 +283,8 @@ impl BaseModel for AnthropicModel {
         let mut thinking = String::new();
         let mut input_tokens: u64 = 0;
         let mut output_tokens: u64 = 0;
+        let mut cache_creation_input_tokens: Option<u64> = None;
+        let mut cache_read_input_tokens: Option<u64> = None;
 
         // Track content blocks by index for tool calls
         struct BlockState {
@@ -273,6 +346,18 @@ impl BaseModel for AnthropicModel {
                             if let Some(usage) = data.pointer("/message/usage") {
                                 if let Some(it) = usage.get("input_tokens").and_then(|v| v.as_u64()) {
                                     input_tokens = it;
+                                }
+                                if let Some(ct) = usage
+                                    .get("cache_creation_input_tokens")
+                                    .and_then(|v| v.as_u64())
+                                {
+                                    cache_creation_input_tokens = Some(ct);
+                                }
+                                if let Some(rt) = usage
+                                    .get("cache_read_input_tokens")
+                                    .and_then(|v| v.as_u64())
+                                {
+                                    cache_read_input_tokens = Some(rt);
                                 }
                             }
                         }
@@ -381,6 +466,18 @@ impl BaseModel for AnthropicModel {
                                 if let Some(ot) = usage.get("output_tokens").and_then(|v| v.as_u64()) {
                                     output_tokens = ot;
                                 }
+                                if let Some(ct) = usage
+                                    .get("cache_creation_input_tokens")
+                                    .and_then(|v| v.as_u64())
+                                {
+                                    cache_creation_input_tokens = Some(ct);
+                                }
+                                if let Some(rt) = usage
+                                    .get("cache_read_input_tokens")
+                                    .and_then(|v| v.as_u64())
+                                {
+                                    cache_read_input_tokens = Some(rt);
+                                }
                             }
                         }
 
@@ -405,6 +502,8 @@ impl BaseModel for AnthropicModel {
             tool_calls,
             input_tokens,
             output_tokens,
+            cache_creation_input_tokens,
+            cache_read_input_tokens,
         })
     }
 
@@ -430,13 +529,28 @@ mod tests {
         )
     }
 
-    // ── is_opus_46 ──
+    // ── uses_adaptive_thinking ──
 
     #[test]
-    fn test_is_opus_46() {
-        assert!(make_model("claude-opus-4-6", None).is_opus_46());
-        assert!(make_model("claude-opus-4.6-20250610", None).is_opus_46());
-        assert!(!make_model("claude-sonnet-4-5", None).is_opus_46());
+    fn test_uses_adaptive_thinking_opus_46() {
+        assert!(make_model("claude-opus-4-6", None).uses_adaptive_thinking());
+        assert!(make_model("claude-opus-4.6-20250610", None).uses_adaptive_thinking());
+        assert!(!make_model("claude-sonnet-4-5", None).uses_adaptive_thinking());
+    }
+
+    #[test]
+    fn test_uses_adaptive_thinking_claude_5_family() {
+        assert!(make_model("claude-opus-5", None).uses_adaptive_thinking());
+        assert!(make_model("claude-sonnet-5", None).uses_adaptive_thinking());
+        assert!(make_model("claude-fable-5-1", None).uses_adaptive_thinking());
+        assert!(make_model("claude-haiku-5-20260101", None).uses_adaptive_thinking());
+    }
+
+    #[test]
+    fn test_uses_adaptive_thinking_legacy_models() {
+        assert!(!make_model("claude-sonnet-4-5", None).uses_adaptive_thinking());
+        assert!(!make_model("claude-haiku-4-5", None).uses_adaptive_thinking());
+        assert!(!make_model("claude-opus-4-1", None).uses_adaptive_thinking());
     }
 
     // ── extract_system ──
@@ -535,7 +649,7 @@ mod tests {
         ];
         let payload = model.build_payload(&msgs, &[]);
         assert_eq!(payload["temperature"], 0.0);
-        assert_eq!(payload["system"], "System");
+        assert_eq!(payload["system"][0]["text"], "System");
         assert_eq!(payload["stream"], true);
         assert!(payload.get("thinking").is_none());
     }
@@ -548,6 +662,16 @@ mod tests {
         assert!(payload.get("temperature").is_none()); // No temperature with thinking
         assert_eq!(payload["thinking"]["type"], "adaptive");
         assert_eq!(payload["output_config"]["effort"], "high");
+    }
+
+    #[test]
+    fn test_payload_claude_opus_5_adaptive_thinking() {
+        let model = make_model("claude-opus-5", Some("high"));
+        let msgs = vec![Message::User { content: "Hi".to_string() }];
+        let payload = model.build_payload(&msgs, &[]);
+        assert_eq!(payload["thinking"]["type"], "adaptive");
+        assert_eq!(payload["output_config"]["effort"], "high");
+        assert!(payload["thinking"].get("budget_tokens").is_none());
     }
 
     #[test]
@@ -568,9 +692,98 @@ mod tests {
         ];
         let payload = model.build_payload(&msgs, &[]);
         // System should be top-level, not in messages array
-        assert_eq!(payload["system"], "You are helpful.");
+        assert_eq!(payload["system"][0]["text"], "You are helpful.");
         let messages = payload["messages"].as_array().unwrap();
         assert!(messages.iter().all(|m| m["role"] != "system"));
+    }
+
+    // ── prompt caching ──
+
+    #[test]
+    fn test_payload_system_has_cache_control() {
+        let model = make_model("claude-sonnet-4-5", None);
+        let msgs = vec![
+            Message::System { content: "Be helpful.".to_string() },
+            Message::User { content: "Hi".to_string() },
+        ];
+        let payload = model.build_payload(&msgs, &[]);
+        let system = payload["system"].as_array().expect("system should be an array");
+        assert_eq!(system.len(), 1);
+        assert_eq!(system[0]["type"], "text");
+        assert_eq!(system[0]["text"], "Be helpful.");
+        assert_eq!(system[0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn test_payload_last_tool_has_cache_control() {
+        let model = make_model("claude-sonnet-4-5", None);
+        let msgs = vec![Message::User { content: "Hi".to_string() }];
+        let tools = vec![
+            serde_json::json!({"name": "read_file", "description": "reads a file"}),
+            serde_json::json!({"name": "list_files", "description": "lists files"}),
+        ];
+        let payload = model.build_payload(&msgs, &tools);
+        let tools_out = payload["tools"].as_array().unwrap();
+        assert_eq!(tools_out.len(), 2);
+        assert!(tools_out[0].get("cache_control").is_none(), "only the last tool should be marked");
+        assert_eq!(tools_out[1]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn test_payload_last_user_message_has_cache_control() {
+        let model = make_model("claude-sonnet-4-5", None);
+        let msgs = vec![Message::User { content: "Hi".to_string() }];
+        let payload = model.build_payload(&msgs, &[]);
+        let messages = payload["messages"].as_array().unwrap();
+        let last = messages.last().unwrap();
+        assert_eq!(last["role"], "user");
+        let content = last["content"].as_array().expect("plain string content should be converted to blocks");
+        let last_block = content.last().unwrap();
+        assert_eq!(last_block["type"], "text");
+        assert_eq!(last_block["text"], "Hi");
+        assert_eq!(last_block["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn test_payload_last_tool_result_message_has_cache_control() {
+        let model = make_model("claude-sonnet-4-5", None);
+        let msgs = vec![
+            Message::Assistant {
+                content: "Using tools.".to_string(),
+                tool_calls: Some(vec![ToolCall {
+                    id: "t1".into(),
+                    name: "read_file".into(),
+                    arguments: "{}".into(),
+                }]),
+            },
+            Message::Tool { tool_call_id: "t1".into(), content: "file contents".into() },
+        ];
+        let payload = model.build_payload(&msgs, &[]);
+        let messages = payload["messages"].as_array().unwrap();
+        let last = messages.last().unwrap();
+        assert_eq!(last["role"], "user");
+        let content = last["content"].as_array().unwrap();
+        let last_block = content.last().unwrap();
+        assert_eq!(last_block["type"], "tool_result");
+        assert_eq!(last_block["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn test_payload_only_last_message_has_cache_control() {
+        let model = make_model("claude-sonnet-4-5", None);
+        let msgs = vec![
+            Message::User { content: "First".to_string() },
+            Message::Assistant { content: "Reply".to_string(), tool_calls: None },
+            Message::User { content: "Second".to_string() },
+        ];
+        let payload = model.build_payload(&msgs, &[]);
+        let messages = payload["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        // First user message should remain a plain string (untouched).
+        assert!(messages[0]["content"].is_string());
+        // Last message (second user turn) should be converted and cache-tagged.
+        let content = messages[2]["content"].as_array().unwrap();
+        assert_eq!(content.last().unwrap()["cache_control"]["type"], "ephemeral");
     }
 
     // ── model_name / provider_name ──

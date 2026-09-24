@@ -86,6 +86,15 @@ pub struct AgentConfig {
     pub max_plan_chars: i64,
     pub max_turn_summaries: i64,
     pub demo: bool,
+
+    /// Model used for `subtask` children when set. `None` = inherit the
+    /// parent's model. Downward-only tier enforcement (see
+    /// `builder::enforce_downward_tier`) still applies against the caller's
+    /// current model at delegation time.
+    pub subtask_model: Option<String>,
+    /// Model used for `execute` (leaf) children when set. Falls back to
+    /// `subtask_model`, then the parent's model, when `None`.
+    pub execute_model: Option<String>,
 }
 
 impl Default for AgentConfig {
@@ -127,6 +136,8 @@ impl Default for AgentConfig {
             max_plan_chars: 40_000,
             max_turn_summaries: 50,
             demo: false,
+            subtask_model: None,
+            execute_model: None,
         }
     }
 }
@@ -225,6 +236,8 @@ impl AgentConfig {
             max_plan_chars: env_int("OPENPLANTER_MAX_PLAN_CHARS", 40_000),
             max_turn_summaries: env_int("OPENPLANTER_MAX_TURN_SUMMARIES", 50),
             demo: env_bool("OPENPLANTER_DEMO", false),
+            subtask_model: env_opt("OPENPLANTER_SUBTASK_MODEL"),
+            execute_model: env_opt("OPENPLANTER_EXECUTE_MODEL"),
         }
     }
 }

@@ -23,12 +23,16 @@ export function createStatusBar(): HTMLElement {
   const tokensEl = document.createElement("span");
   tokensEl.className = "tokens";
 
+  const cacheTokensEl = document.createElement("span");
+  cacheTokensEl.className = "cache-tokens";
+
   bar.appendChild(providerEl);
   bar.appendChild(modelEl);
   bar.appendChild(reasoningEl);
   bar.appendChild(modeEl);
   bar.appendChild(sessionEl);
   bar.appendChild(tokensEl);
+  bar.appendChild(cacheTokensEl);
 
   function render() {
     const s = appState.get();
@@ -46,7 +50,14 @@ export function createStatusBar(): HTMLElement {
 
     const inK = (s.inputTokens / 1000).toFixed(1);
     const outK = (s.outputTokens / 1000).toFixed(1);
-    tokensEl.textContent = `${inK}k in / ${outK}k out`;
+    tokensEl.textContent = `${inK}k in · ${outK}k out`;
+
+    const cacheReadK = (s.cacheReadTokens / 1000).toFixed(1);
+    const cacheWriteK = (s.cacheCreationTokens / 1000).toFixed(1);
+    cacheTokensEl.textContent =
+      s.cacheReadTokens > 0 || s.cacheCreationTokens > 0
+        ? `cache r/w ${cacheReadK}k/${cacheWriteK}k`
+        : "";
   }
 
   appState.subscribe(render);

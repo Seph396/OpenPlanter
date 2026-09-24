@@ -6,7 +6,9 @@
 pub mod context;
 pub mod curator;
 pub mod judge;
+pub mod subagent;
 
+use futures::future::FutureExt;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -16,10 +18,11 @@ use crate::config::AgentConfig;
 use crate::events::{DeltaEvent, DeltaKind, StepEvent, TokenUsage};
 use crate::model::Message;
 use crate::prompts::build_system_prompt;
-use crate::tools::defs::build_tool_defs;
+use crate::tools::defs::{build_tool_defs_mode, ToolMode};
 use crate::tools::WorkspaceTools;
 
 use self::curator::{extract_step_context, run_curator, CuratorResult};
+use self::subagent::{run_plain_tool, spawn_delegation, RecursionCtx};
 
 /// Outcome from a background curator task (success or error).
 enum CuratorOutcome {
@@ -162,6 +165,8 @@ pub async fn demo_solve(
         tokens: TokenUsage {
             input_tokens: 100,
             output_tokens: 50,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
         },
         elapsed_ms: 350,
         is_final: true,
@@ -247,7 +252,8 @@ pub async fn solve(
     ));
 
     // 2. Build tools and messages
-    let tool_defs = build_tool_defs(&provider);
+    let tool_mode = if config.recursive { ToolMode::Recursive } else { ToolMode::Flat };
+    let tool_defs = build_tool_defs_mode(&provider, tool_mode);
     let mut tools = WorkspaceTools::new(config);
 
     let system_prompt = build_system_prompt(
@@ -255,9 +261,18 @@ pub async fn solve(
         config.acceptance_criteria,
         config.demo,
     );
+    let artifacts_dir = config.workspace.join(&config.session_root_dir).join("artifacts");
+    let rctx = RecursionCtx {
+        config,
+        emitter,
+        model: model.as_ref(),
+        provider: &provider,
+        system_prompt: &system_prompt,
+        artifacts_dir,
+    };
     let mut messages = vec![
         Message::System {
-            content: system_prompt,
+            content: system_prompt.clone(),
         },
         Message::User {
             content: objective.to_string(),
@@ -327,6 +342,8 @@ pub async fn solve(
                 tokens: TokenUsage {
                     input_tokens: turn.input_tokens,
                     output_tokens: turn.output_tokens,
+                    cache_creation_input_tokens: turn.cache_creation_input_tokens.unwrap_or(0),
+                    cache_read_input_tokens: turn.cache_read_input_tokens.unwrap_or(0),
                 },
                 elapsed_ms: step_start.elapsed().as_millis() as u64,
                 is_final: true,
@@ -338,25 +355,48 @@ pub async fn solve(
             return;
         }
 
-        // Execute each tool call and collect results
-        for tc in &turn.tool_calls {
-            if cancel.is_cancelled() {
-                emitter.emit_error("Cancelled");
-                tools.cleanup();
-                abort_curators(&mut curator_handles);
-                return;
-            }
+        // Execute tool calls: subtask/execute fan out concurrently (real
+        // recursive sub-agents); everything else runs sequentially in order.
+        if cancel.is_cancelled() {
+            emitter.emit_error("Cancelled");
+            tools.cleanup();
+            abort_curators(&mut curator_handles);
+            return;
+        }
 
+        let mut ordered: Vec<Option<(String, String)>> = vec![None; turn.tool_calls.len()];
+        let mut parallel_idx: Vec<usize> = Vec::new();
+
+        for (i, tc) in turn.tool_calls.iter().enumerate() {
+            if tc.name == "subtask" || tc.name == "execute" {
+                parallel_idx.push(i);
+                continue;
+            }
             emitter.emit_trace(&format!("Executing tool: {} ({})", tc.name, tc.id));
-            let result = tools.execute(&tc.name, &tc.arguments).await;
+            let content = run_plain_tool(&rctx, &mut tools, tc).await;
+            ordered[i] = Some((tc.id.clone(), content));
+        }
 
-            if result.is_error {
-                emitter.emit_trace(&format!("Tool {} error: {}", tc.name, &result.content[..result.content.len().min(200)]));
+        if !parallel_idx.is_empty() {
+            let parent_model_name = model.model_name().to_string();
+            let futs: Vec<_> = parallel_idx
+                .iter()
+                .map(|&i| {
+                    let tc = turn.tool_calls[i].clone();
+                    emitter.emit_trace(&format!("Executing tool: {} ({})", tc.name, tc.id));
+                    spawn_delegation(&rctx, parent_model_name.clone(), tc, 0, cancel.clone()).boxed()
+                })
+                .collect();
+            let results = futures::future::join_all(futs).await;
+            for (k, &i) in parallel_idx.iter().enumerate() {
+                ordered[i] = Some((turn.tool_calls[i].id.clone(), results[k].clone()));
             }
+        }
 
+        for entry in ordered.into_iter().flatten() {
             messages.push(Message::Tool {
-                tool_call_id: tc.id.clone(),
-                content: result.content,
+                tool_call_id: entry.0,
+                content: entry.1,
             });
         }
 
@@ -370,6 +410,8 @@ pub async fn solve(
             tokens: TokenUsage {
                 input_tokens: turn.input_tokens,
                 output_tokens: turn.output_tokens,
+                cache_creation_input_tokens: turn.cache_creation_input_tokens.unwrap_or(0),
+                cache_read_input_tokens: turn.cache_read_input_tokens.unwrap_or(0),
             },
             elapsed_ms: step_start.elapsed().as_millis() as u64,
             is_final: false,

@@ -24,6 +24,12 @@ pub struct ModelTurn {
     pub tool_calls: Vec<ToolCall>,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Tokens written to the prompt cache on this turn (Anthropic only; `None` if not reported).
+    #[serde(default)]
+    pub cache_creation_input_tokens: Option<u64>,
+    /// Tokens read from the prompt cache on this turn (Anthropic only; `None` if not reported).
+    #[serde(default)]
+    pub cache_read_input_tokens: Option<u64>,
 }
 
 /// A conversation message.

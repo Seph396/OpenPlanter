@@ -25,6 +25,12 @@ pub struct StepEvent {
 pub struct TokenUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Tokens written to the prompt cache this step (Anthropic only; 0 if not reported).
+    #[serde(default)]
+    pub cache_creation_input_tokens: u64,
+    /// Tokens read from the prompt cache this step (Anthropic only; 0 if not reported).
+    #[serde(default)]
+    pub cache_read_input_tokens: u64,
 }
 
 /// Streaming delta — partial text from the model.
@@ -126,6 +132,13 @@ pub struct ConfigView {
     pub max_depth: i64,
     pub max_steps_per_call: i64,
     pub demo: bool,
+    /// Model used for `subtask` children. `None` = inherit the parent's model.
+    #[serde(default)]
+    pub subtask_model: Option<String>,
+    /// Model used for `execute` (leaf) children. Falls back to `subtask_model`,
+    /// then the parent's model, when `None`.
+    #[serde(default)]
+    pub execute_model: Option<String>,
 }
 
 /// Partial configuration update from the frontend.
@@ -239,6 +252,36 @@ mod tests {
     }
 
     #[test]
+    fn test_token_usage_serde_roundtrip_with_cache_fields() {
+        let usage = TokenUsage {
+            input_tokens: 1000,
+            output_tokens: 200,
+            cache_creation_input_tokens: 5000,
+            cache_read_input_tokens: 12000,
+        };
+        let json = serde_json::to_string(&usage).unwrap();
+        assert!(json.contains("\"cache_creation_input_tokens\":5000"));
+        assert!(json.contains("\"cache_read_input_tokens\":12000"));
+        let roundtripped: TokenUsage = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtripped.input_tokens, 1000);
+        assert_eq!(roundtripped.output_tokens, 200);
+        assert_eq!(roundtripped.cache_creation_input_tokens, 5000);
+        assert_eq!(roundtripped.cache_read_input_tokens, 12000);
+    }
+
+    #[test]
+    fn test_token_usage_deserializes_without_cache_fields() {
+        // Old payloads (or non-Anthropic providers) that never had the new
+        // fields must still deserialize, defaulting the new counters to 0.
+        let json = r#"{"input_tokens": 42, "output_tokens": 7}"#;
+        let usage: TokenUsage = serde_json::from_str(json).unwrap();
+        assert_eq!(usage.input_tokens, 42);
+        assert_eq!(usage.output_tokens, 7);
+        assert_eq!(usage.cache_creation_input_tokens, 0);
+        assert_eq!(usage.cache_read_input_tokens, 0);
+    }
+
+    #[test]
     fn test_step_event_serialization() {
         let step = StepEvent {
             depth: 0,
@@ -247,6 +290,8 @@ mod tests {
             tokens: TokenUsage {
                 input_tokens: 1234,
                 output_tokens: 567,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
             },
             elapsed_ms: 2345,
             is_final: false,

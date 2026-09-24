@@ -27,6 +27,7 @@ describe("createStatusBar", () => {
     expect(bar.querySelector(".mode")).not.toBeNull();
     expect(bar.querySelector(".session")).not.toBeNull();
     expect(bar.querySelector(".tokens")).not.toBeNull();
+    expect(bar.querySelector(".cache-tokens")).not.toBeNull();
   });
 
   it("shows em dash when provider/model empty", () => {
@@ -87,12 +88,29 @@ describe("createStatusBar", () => {
   it("renders token counts", () => {
     appState.update((s) => ({ ...s, inputTokens: 5000, outputTokens: 2500 }));
     const bar = createStatusBar();
-    expect(bar.querySelector(".tokens")!.textContent).toBe("5.0k in / 2.5k out");
+    expect(bar.querySelector(".tokens")!.textContent).toBe("5.0k in · 2.5k out");
   });
 
   it("renders zero tokens", () => {
     const bar = createStatusBar();
-    expect(bar.querySelector(".tokens")!.textContent).toBe("0.0k in / 0.0k out");
+    expect(bar.querySelector(".tokens")!.textContent).toBe("0.0k in · 0.0k out");
+  });
+
+  it("cache tokens empty when zero", () => {
+    const bar = createStatusBar();
+    expect(bar.querySelector(".cache-tokens")!.textContent).toBe("");
+  });
+
+  it("renders cache read/write tokens when nonzero", () => {
+    appState.update((s) => ({ ...s, cacheReadTokens: 12000, cacheCreationTokens: 5000 }));
+    const bar = createStatusBar();
+    expect(bar.querySelector(".cache-tokens")!.textContent).toBe("cache r/w 12.0k/5.0k");
+  });
+
+  it("renders cache tokens when only read is nonzero", () => {
+    appState.update((s) => ({ ...s, cacheReadTokens: 800, cacheCreationTokens: 0 }));
+    const bar = createStatusBar();
+    expect(bar.querySelector(".cache-tokens")!.textContent).toBe("cache r/w 0.8k/0.0k");
   });
 
   it("updates reactively on state change", () => {

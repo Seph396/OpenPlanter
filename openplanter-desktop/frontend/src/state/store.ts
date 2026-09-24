@@ -64,6 +64,8 @@ export interface AppState {
   sessionId: string | null;
   inputTokens: number;
   outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
   isRunning: boolean;
   messages: ChatMessage[];
   reasoningEffort: string | null;
@@ -75,6 +77,8 @@ export interface AppState {
   currentDepth: number;
   inputHistory: string[];
   inputQueue: string[];
+  subtaskModel: string | null;
+  executeModel: string | null;
 }
 
 export const appState = new Store<AppState>({
@@ -83,6 +87,8 @@ export const appState = new Store<AppState>({
   sessionId: null,
   inputTokens: 0,
   outputTokens: 0,
+  cacheReadTokens: 0,
+  cacheCreationTokens: 0,
   isRunning: false,
   messages: [],
   reasoningEffort: null,
@@ -94,4 +100,6 @@ export const appState = new Store<AppState>({
   currentDepth: 0,
   inputHistory: [],
   inputQueue: [],
+  subtaskModel: null,
+  executeModel: null,
 });

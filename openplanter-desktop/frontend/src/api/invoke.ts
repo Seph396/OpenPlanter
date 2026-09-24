@@ -30,6 +30,10 @@ export async function updateConfig(partial: PartialConfig): Promise<ConfigView> 
   return invoke("update_config", { partial });
 }
 
+export async function setWorkspace(path: string): Promise<ConfigView> {
+  return invoke("set_workspace", { path });
+}
+
 export async function listModels(provider: string): Promise<ModelInfo[]> {
   return invoke("list_models", { provider });
 }
@@ -40,6 +44,10 @@ export async function saveSettings(settings: PersistentSettings): Promise<void> 
 
 export async function getCredentialsStatus(): Promise<Record<string, boolean>> {
   return invoke("get_credentials_status");
+}
+
+export async function setCredential(provider: string, value: string): Promise<Record<string, boolean>> {
+  return invoke("set_credential", { provider, value });
 }
 
 export async function listSessions(limit?: number): Promise<SessionInfo[]> {

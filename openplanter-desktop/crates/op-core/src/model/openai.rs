@@ -298,6 +298,8 @@ impl BaseModel for OpenAIModel {
             tool_calls,
             input_tokens,
             output_tokens,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
         })
     }
 

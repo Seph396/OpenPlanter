@@ -58,6 +58,11 @@ describe("createApp", () => {
     }));
     __setHandler("delete_session", () => {});
     __setHandler("get_session_history", () => []);
+    __setHandler("list_models", (args: { provider: string }) =>
+      args?.provider === "anthropic" || args?.provider === "all"
+        ? [{ id: "claude-opus-4-6", name: "Claude Opus 4.6", provider: "anthropic" }]
+        : []
+    );
   });
 
   afterEach(() => {
@@ -78,14 +83,16 @@ describe("createApp", () => {
     });
   });
 
-  it("renders settings display", () => {
+  it("renders settings display", async () => {
     appState.update((s) => ({ ...s, provider: "anthropic", model: "claude-opus-4-6" }));
     const root = document.createElement("div");
     createApp(root);
     const settings = root.querySelector(".settings-display");
     expect(settings).not.toBeNull();
     expect(settings!.textContent).toContain("anthropic");
-    expect(settings!.textContent).toContain("claude-opus-4-6");
+    await vi.waitFor(() => {
+      expect(settings!.textContent).toContain("claude-opus-4-6");
+    });
   });
 
   it("renders credential status", async () => {
@@ -130,6 +137,289 @@ describe("createApp", () => {
       expect(items.length).toBe(1);
       expect(items[0].textContent).toBe("No sessions yet");
     });
+  });
+
+  it("editing the recursive checkbox calls update_config and updates state", async () => {
+    let received: any = null;
+    __setHandler("update_config", (partial: any) => {
+      received = partial;
+      return {
+        provider: "anthropic",
+        model: "claude-opus-4-6",
+        reasoning_effort: null,
+        workspace: "/tmp/ws",
+        session_id: null,
+        recursive: false,
+        max_depth: 4,
+        max_steps_per_call: 100,
+        demo: false,
+      };
+    });
+
+    appState.update((s) => ({ ...s, recursive: true }));
+    const root = document.createElement("div");
+    document.body.appendChild(root);
+    createApp(root);
+
+    const checkbox = root.querySelector(".settings-recursive-checkbox") as HTMLInputElement;
+    expect(checkbox).not.toBeNull();
+    checkbox.checked = false;
+    checkbox.dispatchEvent(new Event("change"));
+
+    await vi.waitFor(() => {
+      expect(received.partial).toEqual({ recursive: false });
+      expect(appState.get().recursive).toBe(false);
+    });
+  });
+
+  it("editing the max-depth input calls update_config with the new value", async () => {
+    let received: any = null;
+    __setHandler("update_config", (partial: any) => {
+      received = partial;
+      return {
+        provider: "anthropic",
+        model: "claude-opus-4-6",
+        reasoning_effort: null,
+        workspace: "/tmp/ws",
+        session_id: null,
+        recursive: true,
+        max_depth: 8,
+        max_steps_per_call: 100,
+        demo: false,
+      };
+    });
+
+    const root = document.createElement("div");
+    document.body.appendChild(root);
+    createApp(root);
+
+    const input = root.querySelector(".settings-maxdepth-input") as HTMLInputElement;
+    expect(input).not.toBeNull();
+    input.value = "8";
+    input.dispatchEvent(new Event("change"));
+
+    await vi.waitFor(() => {
+      expect(received.partial).toEqual({ max_depth: 8 });
+      expect(appState.get().maxDepth).toBe(8);
+    });
+  });
+
+  it("changing the provider select calls update_config with the new provider", async () => {
+    let received: any = null;
+    __setHandler("update_config", (partial: any) => {
+      received = partial;
+      return {
+        provider: "cerebras",
+        model: "qwen-3-235b-a22b-instruct-2507",
+        reasoning_effort: null,
+        workspace: "/tmp/ws",
+        session_id: null,
+        recursive: true,
+        max_depth: 4,
+        max_steps_per_call: 100,
+        demo: false,
+      };
+    });
+
+    const root = document.createElement("div");
+    document.body.appendChild(root);
+    createApp(root);
+
+    const select = root.querySelector(".settings-provider-select") as HTMLSelectElement;
+    expect(select).not.toBeNull();
+    select.value = "cerebras";
+    select.dispatchEvent(new Event("change"));
+
+    await vi.waitFor(() => {
+      expect(received.partial).toEqual({ provider: "cerebras" });
+      expect(appState.get().provider).toBe("cerebras");
+    });
+  });
+
+  it("renders the sub-agent model and leaf model selects with an inherit option", async () => {
+    appState.update((s) => ({ ...s, provider: "anthropic" }));
+    const root = document.createElement("div");
+    document.body.appendChild(root);
+    createApp(root);
+
+    await vi.waitFor(() => {
+      const subtaskSelect = root.querySelector(".settings-subtask-model-select") as HTMLSelectElement;
+      const executeSelect = root.querySelector(".settings-execute-model-select") as HTMLSelectElement;
+      expect(subtaskSelect).not.toBeNull();
+      expect(executeSelect).not.toBeNull();
+      expect(subtaskSelect.options[0].value).toBe("");
+      expect(subtaskSelect.options[0].textContent).toBe("inherit");
+      expect(executeSelect.options[0].value).toBe("");
+      expect(executeSelect.options[0].textContent).toBe("inherit");
+    });
+  });
+
+  it("changing the sub-agent model select calls update_config with subtask_model", async () => {
+    let received: any = null;
+    __setHandler("update_config", (partial: any) => {
+      received = partial;
+      return {
+        provider: "anthropic",
+        model: "claude-opus-4-6",
+        reasoning_effort: null,
+        workspace: "/tmp/ws",
+        session_id: null,
+        recursive: true,
+        max_depth: 4,
+        max_steps_per_call: 100,
+        demo: false,
+        subtask_model: "claude-sonnet-5",
+        execute_model: null,
+      };
+    });
+
+    appState.update((s) => ({ ...s, provider: "anthropic" }));
+    const root = document.createElement("div");
+    document.body.appendChild(root);
+    createApp(root);
+
+    const select = root.querySelector(".settings-subtask-model-select") as HTMLSelectElement;
+    expect(select).not.toBeNull();
+    await vi.waitFor(() => {
+      expect(select.options.length).toBeGreaterThan(1);
+    });
+    select.value = "claude-opus-4-6";
+    select.dispatchEvent(new Event("change"));
+
+    await vi.waitFor(() => {
+      expect(received.partial).toEqual({ subtask_model: "claude-opus-4-6" });
+      expect(appState.get().subtaskModel).toBe("claude-sonnet-5");
+    });
+  });
+
+  it("changing the leaf model select calls update_config with execute_model", async () => {
+    let received: any = null;
+    __setHandler("update_config", (partial: any) => {
+      received = partial;
+      return {
+        provider: "anthropic",
+        model: "claude-opus-4-6",
+        reasoning_effort: null,
+        workspace: "/tmp/ws",
+        session_id: null,
+        recursive: true,
+        max_depth: 4,
+        max_steps_per_call: 100,
+        demo: false,
+        subtask_model: null,
+        execute_model: "claude-haiku-4-5",
+      };
+    });
+
+    appState.update((s) => ({ ...s, provider: "anthropic" }));
+    const root = document.createElement("div");
+    document.body.appendChild(root);
+    createApp(root);
+
+    const select = root.querySelector(".settings-execute-model-select") as HTMLSelectElement;
+    expect(select).not.toBeNull();
+    await vi.waitFor(() => {
+      expect(select.options.length).toBeGreaterThan(1);
+    });
+    select.value = "claude-opus-4-6";
+    select.dispatchEvent(new Event("change"));
+
+    await vi.waitFor(() => {
+      expect(received.partial).toEqual({ execute_model: "claude-opus-4-6" });
+      expect(appState.get().executeModel).toBe("claude-haiku-4-5");
+    });
+  });
+
+  it("credential input value is cleared and never left in the DOM after save", async () => {
+    let savedProvider = "";
+    let savedValue = "";
+    __setHandler("set_credential", ({ provider, value }: { provider: string; value: string }) => {
+      savedProvider = provider;
+      savedValue = value;
+      return { openai: true, anthropic: true, openrouter: false, cerebras: false, ollama: true, exa: false };
+    });
+
+    const root = document.createElement("div");
+    document.body.appendChild(root);
+    createApp(root);
+
+    await vi.waitFor(() => {
+      expect(root.querySelectorAll(".cred-row").length).toBe(6);
+    });
+
+    const rows = Array.from(root.querySelectorAll(".cred-row"));
+    const openaiRow = rows.find((r) => r.querySelector(".cred-ok, .cred-missing")!.textContent!.includes("openai"))!;
+    const setBtn = openaiRow.querySelector(".cred-set-btn") as HTMLElement;
+    setBtn.click();
+
+    const input = openaiRow.querySelector(".cred-set-input") as HTMLInputElement;
+    expect(input).not.toBeNull();
+    expect(input.type).toBe("password");
+    input.value = "sk-super-secret-value";
+    const saveBtn = openaiRow.querySelector(".cred-save-btn") as HTMLElement;
+    saveBtn.click();
+
+    await vi.waitFor(() => {
+      expect(savedProvider).toBe("openai");
+      expect(savedValue).toBe("sk-super-secret-value");
+    });
+
+    // The value must never remain in the DOM (input cleared, container re-rendered).
+    // credsDisplay is re-rendered asynchronously after the save resolves, so
+    // wait for that continuation rather than asserting immediately.
+    await vi.waitFor(() => {
+      expect(root.innerHTML).not.toContain("sk-super-secret-value");
+      const newInput = root.querySelector(".cred-set-input") as HTMLInputElement | null;
+      if (newInput) expect(newInput.value).toBe("");
+    });
+  });
+
+  it("credential form closes on Escape", async () => {
+    const root = document.createElement("div");
+    document.body.appendChild(root);
+    createApp(root);
+
+    await vi.waitFor(() => {
+      expect(root.querySelectorAll(".cred-row").length).toBe(6);
+    });
+
+    const rows = Array.from(root.querySelectorAll(".cred-row"));
+    const openaiRow = rows.find((r) => r.querySelector(".cred-ok, .cred-missing")!.textContent!.includes("openai"))!;
+    const setBtn = openaiRow.querySelector(".cred-set-btn") as HTMLElement;
+    setBtn.click();
+
+    const form = openaiRow.querySelector(".cred-set-form") as HTMLElement;
+    const input = openaiRow.querySelector(".cred-set-input") as HTMLInputElement;
+    expect(form.style.display).toBe("flex");
+
+    input.value = "sk-typed-but-not-saved";
+    input.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+
+    expect(form.style.display).toBe("none");
+    expect(input.value).toBe("");
+  });
+
+  it("hides the 'model id' row unless a custom model is selected", async () => {
+    appState.update((s) => ({ ...s, provider: "anthropic", model: "claude-opus-4-6" }));
+    const root = document.createElement("div");
+    document.body.appendChild(root);
+    createApp(root);
+
+    const modelSelect = root.querySelector(".settings-model-select") as HTMLSelectElement;
+    await vi.waitFor(() => {
+      expect(modelSelect.options.length).toBeGreaterThan(1);
+    });
+
+    const modelIdInput = root.querySelector(".settings-model-custom-input") as HTMLInputElement;
+    const modelIdRow = modelIdInput.closest(".form-row") as HTMLElement;
+
+    // Known model selected: row stays hidden.
+    expect(modelIdRow.classList.contains("hidden")).toBe(true);
+
+    // Switch to "Custom…": row becomes visible.
+    modelSelect.value = "__custom__";
+    modelSelect.dispatchEvent(new Event("change"));
+    expect(modelIdRow.classList.contains("hidden")).toBe(false);
   });
 });
 

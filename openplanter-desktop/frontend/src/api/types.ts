@@ -3,6 +3,8 @@
 export interface TokenUsage {
   input_tokens: number;
   output_tokens: number;
+  cache_creation_input_tokens?: number;
+  cache_read_input_tokens?: number;
 }
 
 export interface TraceEvent {
@@ -71,12 +73,20 @@ export interface ConfigView {
   max_depth: number;
   max_steps_per_call: number;
   demo: boolean;
+  subtask_model: string | null;
+  execute_model: string | null;
 }
 
 export interface PartialConfig {
   provider?: string;
   model?: string;
   reasoning_effort?: string;
+  recursive?: boolean;
+  max_depth?: number;
+  /** Empty string clears the override back to "inherit". */
+  subtask_model?: string;
+  /** Empty string clears the override back to "inherit". */
+  execute_model?: string;
 }
 
 export interface ModelInfo {
@@ -130,7 +140,7 @@ export interface ReplayEntry {
 
 export type AgentEvent =
   | { type: "trace"; message: string }
-  | { type: "step"; depth: number; step: number; tool_name: string | null; tokens: TokenUsage; elapsed_ms: number; is_final: boolean }
+  | { type: "step"; depth: number; step: number; tool_name: string | null; tokens: TokenUsage; elapsed_ms: number; is_final: boolean; }
   | { type: "delta"; kind: DeltaKind; text: string }
   | { type: "complete"; result: string }
   | { type: "error"; message: string }

@@ -241,6 +241,15 @@ impl CredentialStore {
     }
 }
 
+/// Resolve the current user's home directory (`$HOME` on Unix, `%USERPROFILE%` on Windows).
+/// Falls back to `.` if neither is set.
+pub fn home_dir() -> PathBuf {
+    let home = env::var("HOME")
+        .or_else(|_| env::var("USERPROFILE"))
+        .unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home)
+}
+
 /// User-level credential store at `~/.openplanter/credentials.json`.
 pub struct UserCredentialStore {
     pub credentials_path: PathBuf,
@@ -248,13 +257,8 @@ pub struct UserCredentialStore {
 
 impl UserCredentialStore {
     pub fn new() -> Self {
-        let home = env::var("HOME")
-            .or_else(|_| env::var("USERPROFILE"))
-            .unwrap_or_else(|_| ".".to_string());
         Self {
-            credentials_path: PathBuf::from(home)
-                .join(".openplanter")
-                .join("credentials.json"),
+            credentials_path: home_dir().join(".openplanter").join("credentials.json"),
         }
     }
 

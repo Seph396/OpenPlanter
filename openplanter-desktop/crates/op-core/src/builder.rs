@@ -198,6 +198,65 @@ pub fn resolve_endpoint(
     }
 }
 
+// ---------------------------------------------------------------------
+// Sub-agent model tier selection (per-tier models for `subtask`/`execute`).
+//
+// Tier order (cheapest last): opus(1) > sonnet(2) > haiku(3), by substring
+// match on the model name. Unknown model names have no known tier and are
+// always treated as equal to the parent's tier (allowed — no clamp).
+// ---------------------------------------------------------------------
+
+/// Capability tier for a model name, lower = more expensive/capable.
+/// `None` if the name doesn't match a known Anthropic tier keyword.
+fn known_tier(model_name: &str) -> Option<u8> {
+    let lower = model_name.to_lowercase();
+    if lower.contains("opus") {
+        Some(1)
+    } else if lower.contains("sonnet") {
+        Some(2)
+    } else if lower.contains("haiku") {
+        Some(3)
+    } else {
+        None
+    }
+}
+
+/// Clamp `desired_model` to `parent_model`'s tier if it would be a more
+/// expensive (lower-numbered) tier than the parent. A child may never use a
+/// more capable/expensive tier than its parent — only equal or cheaper.
+///
+/// If either name has an unknown tier, no clamp is applied (treated as
+/// equal/allowed), per the brief's explicit "unknown => treat as parent
+/// tier" rule.
+pub fn enforce_downward_tier(parent_model: &str, desired_model: &str) -> String {
+    match (known_tier(parent_model), known_tier(desired_model)) {
+        (Some(parent_tier), Some(desired_tier)) if desired_tier < parent_tier => {
+            parent_model.to_string()
+        }
+        _ => desired_model.to_string(),
+    }
+}
+
+/// Resolve the model name a `subtask`/`execute` delegation should use, given
+/// the static per-tier config fields and the calling level's current model
+/// name. Returns `None` when there is no override configured (inherit the
+/// parent's model unchanged — no new model needs to be built).
+///
+/// Precedence: `execute` children use `execute_model`, else `subtask_model`,
+/// else inherit. `subtask` children use `subtask_model`, else inherit.
+pub fn select_child_model_name(
+    cfg: &AgentConfig,
+    is_execute: bool,
+    parent_model_name: &str,
+) -> Option<String> {
+    let desired = if is_execute {
+        cfg.execute_model.clone().or_else(|| cfg.subtask_model.clone())
+    } else {
+        cfg.subtask_model.clone()
+    }?;
+    Some(enforce_downward_tier(parent_model_name, &desired))
+}
+
 /// Build a model instance from the agent configuration.
 pub fn build_model(cfg: &AgentConfig) -> Result<Box<dyn BaseModel>, ModelError> {
     let provider = resolve_provider(cfg)?;
@@ -536,6 +595,99 @@ mod tests {
             Ok(_) => panic!("expected error"),
         };
         assert!(err_msg.contains("openai"), "error should mention openai: {err_msg}");
+    }
+
+    // ── tier enforcement / model selection ──
+
+    #[test]
+    fn test_enforce_downward_tier_blocks_upgrade() {
+        // Parent sonnet, child requests opus (more expensive) => clamped to parent's model.
+        let result = enforce_downward_tier("claude-sonnet-4-5", "claude-opus-4-6");
+        assert_eq!(result, "claude-sonnet-4-5");
+    }
+
+    #[test]
+    fn test_enforce_downward_tier_allows_downgrade() {
+        // Parent sonnet, child requests haiku (cheaper) => allowed as requested.
+        let result = enforce_downward_tier("claude-sonnet-4-5", "claude-haiku-4-5");
+        assert_eq!(result, "claude-haiku-4-5");
+    }
+
+    #[test]
+    fn test_enforce_downward_tier_allows_equal() {
+        let result = enforce_downward_tier("claude-sonnet-4-5", "claude-sonnet-5");
+        assert_eq!(result, "claude-sonnet-5");
+    }
+
+    #[test]
+    fn test_enforce_downward_tier_unknown_parent_allowed() {
+        // Parent tier unknown (custom model) => no clamp, desired passes through.
+        let result = enforce_downward_tier("some-custom-model", "claude-opus-4-6");
+        assert_eq!(result, "claude-opus-4-6");
+    }
+
+    #[test]
+    fn test_enforce_downward_tier_unknown_desired_allowed() {
+        // Desired tier unknown => no clamp, desired passes through.
+        let result = enforce_downward_tier("claude-opus-4-6", "some-custom-model");
+        assert_eq!(result, "some-custom-model");
+    }
+
+    #[test]
+    fn test_select_child_model_name_none_when_unconfigured() {
+        let cfg = AgentConfig::default();
+        assert_eq!(select_child_model_name(&cfg, false, "claude-opus-4-6"), None);
+        assert_eq!(select_child_model_name(&cfg, true, "claude-opus-4-6"), None);
+    }
+
+    #[test]
+    fn test_select_child_model_name_subtask_precedence() {
+        let cfg = AgentConfig {
+            subtask_model: Some("claude-sonnet-5".into()),
+            execute_model: None,
+            ..Default::default()
+        };
+        // subtask call uses subtask_model
+        assert_eq!(
+            select_child_model_name(&cfg, false, "claude-opus-4-6"),
+            Some("claude-sonnet-5".into())
+        );
+        // execute call falls back to subtask_model when execute_model unset
+        assert_eq!(
+            select_child_model_name(&cfg, true, "claude-opus-4-6"),
+            Some("claude-sonnet-5".into())
+        );
+    }
+
+    #[test]
+    fn test_select_child_model_name_execute_overrides_subtask() {
+        let cfg = AgentConfig {
+            subtask_model: Some("claude-sonnet-5".into()),
+            execute_model: Some("claude-haiku-4-5".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            select_child_model_name(&cfg, false, "claude-opus-4-6"),
+            Some("claude-sonnet-5".into())
+        );
+        assert_eq!(
+            select_child_model_name(&cfg, true, "claude-opus-4-6"),
+            Some("claude-haiku-4-5".into())
+        );
+    }
+
+    #[test]
+    fn test_select_child_model_name_tier_clamped() {
+        // Parent already downgraded to sonnet; execute requests opus => clamp to sonnet.
+        let cfg = AgentConfig {
+            subtask_model: None,
+            execute_model: Some("claude-opus-4-6".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            select_child_model_name(&cfg, true, "claude-sonnet-4-5"),
+            Some("claude-sonnet-4-5".into())
+        );
     }
 
     #[test]

@@ -12,7 +12,8 @@
     "test:e2e": "npx playwright test --config e2e/playwright.config.ts"
   },
   "dependencies": {
-    "@tauri-apps/api": "^2.0.0",
+    "@tauri-apps/api": "^2.10.1",
+    "@tauri-apps/plugin-dialog": "^2.7.3",
     "cytoscape": "^3.30.0",
     "cytoscape-dagre": "^2.5.0",
     "cytoscape-fcose": "^2.2.0",

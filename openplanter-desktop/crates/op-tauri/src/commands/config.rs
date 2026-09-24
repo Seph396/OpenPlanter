@@ -1,9 +1,30 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
+use serde::Deserialize;
 use tauri::State;
-use crate::state::AppState;
-use op_core::events::{ConfigView, ModelInfo, PartialConfig};
+use crate::state::{load_config_for, save_credential, save_ui_prefs, AppState, UiPrefs};
+use op_core::events::{ConfigView, ModelInfo};
 use op_core::settings::{PersistentSettings, SettingsStore};
 use op_core::credentials::credentials_from_env;
+use op_core::workspace::persist_last_workspace;
+
+/// Partial configuration update from the frontend's editable sidebar.
+///
+/// Op-tauri-local (not `op_core::events::PartialConfig`) so the sidebar's
+/// recursive/max_depth controls don't require changing the shared op-core
+/// event schema owned by the backend agent's worktree.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct PartialConfig {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub recursive: Option<bool>,
+    pub max_depth: Option<i64>,
+    /// `Some("")` clears the override back to "inherit"; `None` leaves it unchanged.
+    pub subtask_model: Option<String>,
+    /// `Some("")` clears the override back to "inherit"; `None` leaves it unchanged.
+    pub execute_model: Option<String>,
+}
 
 /// Get the current configuration.
 #[tauri::command]
@@ -22,16 +43,13 @@ pub async fn get_config(
         max_depth: cfg.max_depth,
         max_steps_per_call: cfg.max_steps_per_call,
         demo: cfg.demo,
+        subtask_model: cfg.subtask_model.clone(),
+        execute_model: cfg.execute_model.clone(),
     })
 }
 
-/// Update configuration fields.
-#[tauri::command]
-pub async fn update_config(
-    partial: PartialConfig,
-    state: State<'_, AppState>,
-) -> Result<ConfigView, String> {
-    let mut cfg = state.config.lock().await;
+/// Apply a `PartialConfig` update onto `cfg` in place. Pure/testable — no I/O.
+pub fn apply_partial_config(cfg: &mut op_core::config::AgentConfig, partial: PartialConfig) {
     if let Some(provider) = partial.provider {
         cfg.provider = provider;
     }
@@ -45,6 +63,43 @@ pub async fn update_config(
             Some(effort)
         };
     }
+    if let Some(recursive) = partial.recursive {
+        cfg.recursive = recursive;
+    }
+    if let Some(max_depth) = partial.max_depth {
+        cfg.max_depth = max_depth;
+    }
+    if let Some(subtask_model) = partial.subtask_model {
+        cfg.subtask_model = if subtask_model.is_empty() { None } else { Some(subtask_model) };
+    }
+    if let Some(execute_model) = partial.execute_model {
+        cfg.execute_model = if execute_model.is_empty() { None } else { Some(execute_model) };
+    }
+}
+
+/// Update configuration fields.
+#[tauri::command]
+pub async fn update_config(
+    partial: PartialConfig,
+    state: State<'_, AppState>,
+) -> Result<ConfigView, String> {
+    let mut cfg = state.config.lock().await;
+    apply_partial_config(&mut cfg, partial);
+
+    // Persist the sidebar's selections so they survive relaunch.
+    let prefs = UiPrefs {
+        provider: Some(cfg.provider.clone()),
+        model: Some(cfg.model.clone()),
+        reasoning_effort: cfg.reasoning_effort.clone(),
+        recursive: Some(cfg.recursive),
+        max_depth: Some(cfg.max_depth),
+        subtask_model: cfg.subtask_model.clone(),
+        execute_model: cfg.execute_model.clone(),
+    };
+    if let Err(e) = save_ui_prefs(&cfg.workspace, &prefs) {
+        eprintln!("[config] failed to persist UI prefs: {e}");
+    }
+
     let session_id = state.session_id.lock().await;
     Ok(ConfigView {
         provider: cfg.provider.clone(),
@@ -56,7 +111,34 @@ pub async fn update_config(
         max_depth: cfg.max_depth,
         max_steps_per_call: cfg.max_steps_per_call,
         demo: cfg.demo,
+        subtask_model: cfg.subtask_model.clone(),
+        execute_model: cfg.execute_model.clone(),
     })
+}
+
+/// Save an API key for `provider`: writes to the user credential store
+/// (`~/.openplanter/credentials.json`) and, on macOS, the Keychain. Never
+/// logs `value`. Reloads config for the active workspace so the new
+/// credential is merged in immediately, and returns the fresh status map.
+#[tauri::command]
+pub async fn set_credential(
+    provider: String,
+    value: String,
+    state: State<'_, AppState>,
+) -> Result<HashMap<String, bool>, String> {
+    let provider = provider.trim().to_lowercase();
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        return Err("Credential value must not be empty".to_string());
+    }
+
+    save_credential(&provider, &value)?;
+
+    let mut cfg = state.config.lock().await;
+    let workspace = cfg.workspace.clone();
+    *cfg = load_config_for(&workspace);
+
+    Ok(build_credential_status(&cfg))
 }
 
 /// Known models per provider for listing.
@@ -74,6 +156,9 @@ fn known_models_for_provider(provider: &str) -> Vec<ModelInfo> {
             ("claude-opus-4-6", "Claude Opus 4.6"),
             ("claude-sonnet-4-5", "Claude Sonnet 4.5"),
             ("claude-haiku-4-5", "Claude Haiku 4.5"),
+            ("claude-opus-5", "Claude Opus 5"),
+            ("claude-sonnet-5", "Claude Sonnet 5"),
+            ("claude-fable-5-1", "Claude Fable 5.1"),
         ],
         "openrouter" => vec![
             ("anthropic/claude-sonnet-4-5", "Claude Sonnet 4.5 (OR)"),
@@ -120,6 +205,49 @@ pub async fn list_models(
     } else {
         Ok(known_models_for_provider(&provider))
     }
+}
+
+/// Validate that `path` refers to an existing directory, returning it as a `PathBuf`.
+pub fn validate_workspace_dir(path: &str) -> Result<PathBuf, String> {
+    let workspace = PathBuf::from(path);
+    if !workspace.is_dir() {
+        return Err(format!("Workspace directory does not exist: {}", path));
+    }
+    Ok(workspace)
+}
+
+/// Switch the active workspace: validates the directory exists, rebuilds the
+/// `AgentConfig` for it (same credential merge as startup), swaps it into
+/// state, clears the active session, and persists it as the last-used workspace.
+#[tauri::command]
+pub async fn set_workspace(
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<ConfigView, String> {
+    let workspace = validate_workspace_dir(&path)?;
+
+    let new_cfg = load_config_for(&workspace);
+    persist_last_workspace(&new_cfg.workspace);
+
+    let mut cfg = state.config.lock().await;
+    *cfg = new_cfg;
+
+    let mut session_id = state.session_id.lock().await;
+    *session_id = None;
+
+    Ok(ConfigView {
+        provider: cfg.provider.clone(),
+        model: cfg.model.clone(),
+        reasoning_effort: cfg.reasoning_effort.clone(),
+        workspace: cfg.workspace.display().to_string(),
+        session_id: session_id.clone(),
+        recursive: cfg.recursive,
+        max_depth: cfg.max_depth,
+        max_steps_per_call: cfg.max_steps_per_call,
+        demo: cfg.demo,
+        subtask_model: cfg.subtask_model.clone(),
+        execute_model: cfg.execute_model.clone(),
+    })
 }
 
 /// Save persistent settings to disk.
@@ -182,6 +310,30 @@ pub async fn get_credentials_status(
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    // ── validate_workspace_dir ──
+
+    #[test]
+    fn test_validate_workspace_dir_missing_rejected() {
+        let result = validate_workspace_dir("/definitely/does/not/exist/openplanter-xyz");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_workspace_dir_existing_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = validate_workspace_dir(dir.path().to_str().unwrap());
+        assert_eq!(result.unwrap(), dir.path());
+    }
+
+    #[test]
+    fn test_validate_workspace_dir_file_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("not-a-dir.txt");
+        std::fs::write(&file_path, "x").unwrap();
+        let result = validate_workspace_dir(file_path.to_str().unwrap());
+        assert!(result.is_err());
+    }
 
     // ── known_models_for_provider ──
 
@@ -319,5 +471,94 @@ mod tests {
         let cfg = op_core::config::AgentConfig::from_env("/nonexistent");
         let status = build_credential_status(&cfg);
         assert_eq!(status.len(), 6, "should have 6 entries (5 providers + exa)");
+    }
+
+    // ── apply_partial_config (recursive / max_depth) ──
+
+    #[test]
+    fn test_apply_partial_config_recursive_and_max_depth() {
+        let mut cfg = op_core::config::AgentConfig::from_env("/nonexistent");
+        cfg.recursive = true;
+        cfg.max_depth = 4;
+
+        apply_partial_config(
+            &mut cfg,
+            PartialConfig {
+                recursive: Some(false),
+                max_depth: Some(8),
+                ..Default::default()
+            },
+        );
+
+        assert!(!cfg.recursive);
+        assert_eq!(cfg.max_depth, 8);
+    }
+
+    #[test]
+    fn test_apply_partial_config_none_fields_preserve_existing() {
+        let mut cfg = op_core::config::AgentConfig::from_env("/nonexistent");
+        cfg.recursive = true;
+        cfg.max_depth = 4;
+        cfg.provider = "anthropic".to_string();
+
+        apply_partial_config(&mut cfg, PartialConfig::default());
+
+        assert!(cfg.recursive);
+        assert_eq!(cfg.max_depth, 4);
+        assert_eq!(cfg.provider, "anthropic");
+    }
+
+    #[test]
+    fn test_apply_partial_config_all_fields() {
+        let mut cfg = op_core::config::AgentConfig::from_env("/nonexistent");
+
+        apply_partial_config(
+            &mut cfg,
+            PartialConfig {
+                provider: Some("openrouter".to_string()),
+                model: Some("anthropic/claude-sonnet-4-5".to_string()),
+                reasoning_effort: Some("medium".to_string()),
+                recursive: Some(false),
+                max_depth: Some(2),
+                subtask_model: Some("claude-sonnet-5".to_string()),
+                execute_model: Some("claude-haiku-4-5".to_string()),
+            },
+        );
+
+        assert_eq!(cfg.provider, "openrouter");
+        assert_eq!(cfg.model, "anthropic/claude-sonnet-4-5");
+        assert_eq!(cfg.reasoning_effort, Some("medium".to_string()));
+        assert!(!cfg.recursive);
+        assert_eq!(cfg.max_depth, 2);
+        assert_eq!(cfg.subtask_model, Some("claude-sonnet-5".to_string()));
+        assert_eq!(cfg.execute_model, Some("claude-haiku-4-5".to_string()));
+    }
+
+    #[test]
+    fn test_apply_partial_config_subtask_execute_model_clear_to_inherit() {
+        let mut cfg = op_core::config::AgentConfig::from_env("/nonexistent");
+        cfg.subtask_model = Some("claude-sonnet-5".into());
+        cfg.execute_model = Some("claude-haiku-4-5".into());
+
+        apply_partial_config(
+            &mut cfg,
+            PartialConfig {
+                subtask_model: Some(String::new()),
+                execute_model: Some(String::new()),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(cfg.subtask_model, None);
+        assert_eq!(cfg.execute_model, None);
+    }
+
+    #[test]
+    fn test_partial_config_deserializes_from_json() {
+        let json = r#"{"recursive": false, "max_depth": 7}"#;
+        let partial: PartialConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(partial.recursive, Some(false));
+        assert_eq!(partial.max_depth, Some(7));
+        assert!(partial.provider.is_none());
     }
 }

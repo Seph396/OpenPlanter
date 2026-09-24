@@ -41,6 +41,8 @@ async function init() {
       workspace: config.workspace,
       maxDepth: config.max_depth,
       maxStepsPerCall: config.max_steps_per_call,
+      subtaskModel: config.subtask_model,
+      executeModel: config.execute_model,
     }));
   } catch (e) {
     console.error("Failed to load config:", e);
@@ -50,6 +52,8 @@ async function init() {
   const state = appState.get();
   const reasoningLabel = state.reasoningEffort ?? "off";
   const modeLabel = state.recursive ? "recursive" : "flat";
+  const workspaceBase =
+    (state.workspace || ".").split(/[\\/]/).filter(Boolean).pop() || state.workspace || ".";
 
   appState.update((s) => ({
     ...s,
@@ -68,14 +72,14 @@ async function init() {
           `model: ${model || "—"}`,
           `reasoning: ${reasoningLabel}`,
           `mode: ${modeLabel}`,
-          `workspace: ${state.workspace || "."}`,
-        ].join("  |  "),
+          `workspace: ${workspaceBase}`,
+        ].join("  ·  "),
         timestamp: Date.now(),
       },
       {
         id: crypto.randomUUID(),
         role: "system" as const,
-        content: "Type /help for commands. ESC to cancel a running task.",
+        content: "Send an objective or type /help",
         timestamp: Date.now(),
       },
     ],
@@ -91,6 +95,8 @@ async function init() {
       ...s,
       inputTokens: s.inputTokens + event.tokens.input_tokens,
       outputTokens: s.outputTokens + event.tokens.output_tokens,
+      cacheReadTokens: s.cacheReadTokens + (event.tokens.cache_read_input_tokens ?? 0),
+      cacheCreationTokens: s.cacheCreationTokens + (event.tokens.cache_creation_input_tokens ?? 0),
       currentStep: event.step,
       currentDepth: event.depth,
     }));

@@ -486,6 +486,36 @@ export function createGraphPane(): HTMLElement {
     autoRefreshGraph();
   });
 
+  // --- Live refresh while a run is in progress: watch write_file/edit_file
+  // tool calls (streamed via agent-delta) for a path under .openplanter/wiki/,
+  // and debounce 2s so a burst of edits to the same file only triggers one
+  // reload. No polling — purely event-driven off the existing delta stream. ---
+  const WIKI_PATH_TOOLS = new Set(["write_file", "edit_file", "apply_patch", "hashline_edit"]);
+  let pendingToolName = "";
+  let pendingArgsBuf = "";
+  let wikiWriteDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+
+  window.addEventListener("agent-delta", ((e: CustomEvent<{ kind: string; text: string }>) => {
+    const { kind, text } = e.detail ?? {};
+    if (kind === "tool_call_start") {
+      pendingToolName = text;
+      pendingArgsBuf = "";
+      return;
+    }
+    if (kind !== "tool_call_args" || !WIKI_PATH_TOOLS.has(pendingToolName)) return;
+
+    pendingArgsBuf += text;
+    const match = pendingArgsBuf.match(/"path"\s*:\s*"([^"]*)"?/);
+    const path = match?.[1];
+    if (!path || !path.includes(".openplanter/wiki/")) return;
+
+    if (wikiWriteDebounceTimer) clearTimeout(wikiWriteDebounceTimer);
+    wikiWriteDebounceTimer = setTimeout(() => {
+      wikiWriteDebounceTimer = null;
+      autoRefreshGraph();
+    }, 2000);
+  }) as EventListener);
+
   // Auto-refresh graph when background curator updates wiki files
   window.addEventListener("curator-done", () => {
     autoRefreshGraph();

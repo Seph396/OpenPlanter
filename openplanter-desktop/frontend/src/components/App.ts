@@ -1,11 +1,26 @@
 /** Root layout component. */
+import { open } from "@tauri-apps/plugin-dialog";
 import { createStatusBar } from "./StatusBar";
 import { createChatPane } from "./ChatPane";
 import { createGraphPane } from "./GraphPane";
 import { appState } from "../state/store";
-import { listSessions, openSession, deleteSession, getCredentialsStatus, getSessionHistory } from "../api/invoke";
+import {
+  listSessions,
+  openSession,
+  deleteSession,
+  getCredentialsStatus,
+  getSessionHistory,
+  setWorkspace,
+  updateConfig,
+  listModels,
+  setCredential,
+} from "../api/invoke";
 import type { ChatMessage } from "../state/store";
 import type { ReplayEntry } from "../api/types";
+
+const PROVIDERS = ["auto", "openai", "anthropic", "openrouter", "cerebras", "ollama"];
+const REASONING_LEVELS = ["none", "low", "medium", "high"];
+const CRED_PROVIDERS = ["openai", "anthropic", "openrouter", "cerebras", "ollama", "exa"];
 
 export function createApp(root: HTMLElement): void {
   // Status bar
@@ -33,23 +48,80 @@ export function createApp(root: HTMLElement): void {
   sessionList.className = "session-list";
   sidebar.appendChild(sessionList);
 
-  const settingsHeader = document.createElement("h3");
-  settingsHeader.style.marginTop = "16px";
-  settingsHeader.textContent = "Settings";
-  sidebar.appendChild(settingsHeader);
-
+  // Model section
+  const modelSection = document.createElement("div");
+  modelSection.className = "sidebar-section";
+  const modelHeader = document.createElement("h3");
+  modelHeader.textContent = "Model";
+  modelSection.appendChild(modelHeader);
   const settingsDisplay = document.createElement("div");
   settingsDisplay.className = "settings-display";
-  sidebar.appendChild(settingsDisplay);
+  modelSection.appendChild(settingsDisplay);
+  sidebar.appendChild(modelSection);
 
+  // Agents section
+  const agentsSection = document.createElement("div");
+  agentsSection.className = "sidebar-section";
+  const agentsHeader = document.createElement("h3");
+  agentsHeader.textContent = "Agents";
+  agentsSection.appendChild(agentsHeader);
+  const agentsDisplay = document.createElement("div");
+  agentsDisplay.className = "settings-display";
+  agentsSection.appendChild(agentsDisplay);
+  sidebar.appendChild(agentsSection);
+
+  const { elements: settingsEls, render: renderSettingsControls } = buildSettingsControls(
+    settingsDisplay,
+    agentsDisplay
+  );
+
+  // Workspace section: current path + folder picker
+  const workspaceSection = document.createElement("div");
+  workspaceSection.className = "sidebar-section";
+  const workspaceHeader = document.createElement("h3");
+  workspaceHeader.textContent = "Workspace";
+  workspaceSection.appendChild(workspaceHeader);
+
+  const workspaceRow = document.createElement("div");
+  workspaceRow.className = "form-row";
+  workspaceRow.style.gridTemplateColumns = "1fr auto";
+
+  const workspaceLabel = document.createElement("span");
+  workspaceLabel.className = "workspace-path";
+
+  const openFolderBtn = document.createElement("button");
+  openFolderBtn.textContent = "Open Folder…";
+  openFolderBtn.className = "btn";
+  openFolderBtn.addEventListener("click", () => openWorkspacePicker(workspaceLabel, sessionList, credsDisplay));
+
+  workspaceRow.appendChild(workspaceLabel);
+  workspaceRow.appendChild(openFolderBtn);
+  workspaceSection.appendChild(workspaceRow);
+  sidebar.appendChild(workspaceSection);
+
+  function renderWorkspaceLabel() {
+    const ws = appState.get().workspace || "";
+    const base = ws.split(/[\\/]/).filter(Boolean).pop() || ws || "—";
+    workspaceLabel.textContent = "";
+    const bold = document.createElement("b");
+    bold.textContent = base;
+    workspaceLabel.appendChild(bold);
+    workspaceLabel.title = ws;
+  }
+  appState.subscribe(renderWorkspaceLabel);
+  renderWorkspaceLabel();
+
+  // Accounts section (credentials)
+  const accountsSection = document.createElement("div");
+  accountsSection.className = "sidebar-section";
   const credsHeader = document.createElement("h3");
-  credsHeader.style.marginTop = "16px";
-  credsHeader.textContent = "Credentials";
-  sidebar.appendChild(credsHeader);
+  credsHeader.textContent = "Accounts";
+  accountsSection.appendChild(credsHeader);
 
   const credsDisplay = document.createElement("div");
   credsDisplay.className = "cred-status";
-  sidebar.appendChild(credsDisplay);
+  accountsSection.appendChild(credsDisplay);
+  sidebar.appendChild(accountsSection);
 
   root.appendChild(sidebar);
 
@@ -61,21 +133,21 @@ export function createApp(root: HTMLElement): void {
   const graphPane = createGraphPane();
   root.appendChild(graphPane);
 
-  // Reactive settings display
-  function renderSettings() {
-    const s = appState.get();
-    settingsDisplay.innerHTML = [
-      `<div><span class="label">provider:</span> <span class="value">${s.provider || "auto"}</span></div>`,
-      `<div><span class="label">model:</span> <span class="value">${s.model || "\u2014"}</span></div>`,
-      `<div><span class="label">reasoning:</span> <span class="value">${s.reasoningEffort ?? "off"}</span></div>`,
-      `<div><span class="label">mode:</span> <span class="value">${s.recursive ? "recursive" : "flat"}</span></div>`,
-    ].join("");
-  }
-  appState.subscribe(renderSettings);
-  renderSettings();
+  // Reactive settings controls (provider/model/reasoning/recursive/max_depth)
+  appState.subscribe(renderSettingsControls);
+  renderSettingsControls();
+  void settingsEls; // controls are wired inside buildSettingsControls
 
   // Load sessions
   loadSessions(sessionList);
+
+  // Reload session list when session changes. This is the single source of
+  // truth for refreshing the list \u2014 covers every path that mutates the
+  // active session, including InputBar's lazy session creation on first
+  // message (which otherwise left the sidebar list stale).
+  window.addEventListener("session-changed", () => {
+    loadSessions(sessionList);
+  });
 
   // Reload session list when session changes
   appState.subscribe(() => {
@@ -84,6 +156,303 @@ export function createApp(root: HTMLElement): void {
 
   // Load credentials status
   loadCredentials(credsDisplay);
+}
+
+/**
+ * Build the editable settings controls (provider/model/reasoning/recursive/max_depth)
+ * inside `container`. Returns the built elements plus a `render` function that
+ * syncs control values from `appState` — called on every state change, but only
+ * touches the DOM for fields that actually changed so it never stomps on
+ * in-progress typing (e.g. the max-depth number input).
+ */
+function buildSettingsControls(
+  modelContainer: HTMLElement,
+  agentsContainer: HTMLElement
+): {
+  elements: {
+    providerSelect: HTMLSelectElement;
+    modelSelect: HTMLSelectElement;
+    reasoningSelect: HTMLSelectElement;
+    recursiveCheckbox: HTMLInputElement;
+    maxDepthInput: HTMLInputElement;
+    subtaskModelSelect: HTMLSelectElement;
+    executeModelSelect: HTMLSelectElement;
+  };
+  render: () => void;
+} {
+  modelContainer.innerHTML = "";
+  agentsContainer.innerHTML = "";
+
+  function row(labelText: string, control: HTMLElement): HTMLElement {
+    const r = document.createElement("div");
+    r.className = "form-row";
+    const label = document.createElement("span");
+    label.className = "label";
+    label.textContent = labelText;
+    r.append(label, control);
+    return r;
+  }
+
+  const providerSelect = document.createElement("select");
+  providerSelect.className = "settings-provider-select value";
+  for (const p of PROVIDERS) {
+    const opt = document.createElement("option");
+    opt.value = p;
+    opt.textContent = p;
+    providerSelect.appendChild(opt);
+  }
+
+  const modelSelect = document.createElement("select");
+  modelSelect.className = "settings-model-select value";
+
+  const modelCustomInput = document.createElement("input");
+  modelCustomInput.type = "text";
+  modelCustomInput.className = "settings-model-custom-input";
+  modelCustomInput.placeholder = "custom model id";
+
+  const reasoningSelect = document.createElement("select");
+  reasoningSelect.className = "settings-reasoning-select value";
+  for (const lvl of REASONING_LEVELS) {
+    const opt = document.createElement("option");
+    opt.value = lvl === "none" ? "" : lvl;
+    opt.textContent = lvl;
+    reasoningSelect.appendChild(opt);
+  }
+
+  const recursiveCheckbox = document.createElement("input");
+  recursiveCheckbox.type = "checkbox";
+  recursiveCheckbox.className = "settings-recursive-checkbox";
+
+  const maxDepthInput = document.createElement("input");
+  maxDepthInput.type = "number";
+  maxDepthInput.min = "1";
+  maxDepthInput.max = "20";
+  maxDepthInput.className = "settings-maxdepth-input";
+
+  const subtaskModelSelect = document.createElement("select");
+  subtaskModelSelect.className = "settings-subtask-model-select value";
+
+  const executeModelSelect = document.createElement("select");
+  executeModelSelect.className = "settings-execute-model-select value";
+
+  const tierModelHint = document.createElement("div");
+  tierModelHint.className = "settings-hint";
+  tierModelHint.textContent = "Recommended: sub-agent claude-sonnet-5, leaf claude-haiku-4-5";
+
+  const modelIdRow = row("model id", modelCustomInput);
+  modelIdRow.classList.add("hidden"); // shown only when "Custom…" is selected
+
+  function syncModelIdRowVisibility(): void {
+    modelIdRow.classList.toggle("hidden", modelSelect.value !== "__custom__");
+  }
+
+  modelContainer.append(
+    row("provider", providerSelect),
+    row("model", modelSelect),
+    modelIdRow,
+    row("reasoning", reasoningSelect)
+  );
+
+  agentsContainer.append(
+    row("recursive", recursiveCheckbox),
+    row("max depth", maxDepthInput),
+    row("sub-agent model", subtaskModelSelect),
+    row("leaf model", executeModelSelect),
+    tierModelHint
+  );
+
+  /** Populate the model select with known models for `provider`, keeping `currentModel` selected. */
+  async function refreshModelOptions(provider: string, currentModel: string): Promise<void> {
+    modelSelect.innerHTML = "";
+    const customOpt = document.createElement("option");
+    customOpt.value = "__custom__";
+    customOpt.textContent = "Custom…";
+    modelSelect.appendChild(customOpt);
+
+    // Show the current model immediately (synchronously) so the select never
+    // looks empty while the known-models fetch is in flight.
+    let matched = false;
+    try {
+      const models = await listModels(provider === "auto" ? "all" : provider);
+      for (const m of models) {
+        const opt = document.createElement("option");
+        opt.value = m.id;
+        opt.textContent = m.name ? `${m.name} (${m.id})` : m.id;
+        if (m.id === currentModel) matched = true;
+        modelSelect.appendChild(opt);
+      }
+    } catch (e) {
+      console.error("Failed to list models:", e);
+    }
+
+    if (!matched && currentModel) {
+      const opt = document.createElement("option");
+      opt.value = currentModel;
+      opt.textContent = currentModel;
+      modelSelect.insertBefore(opt, modelSelect.firstChild!.nextSibling);
+    }
+    modelSelect.value = currentModel || "__custom__";
+    syncModelIdRowVisibility();
+  }
+
+  /** Populate a tier-model select ("inherit" + known models for `provider`), keeping `currentValue` selected. */
+  async function refreshTierModelOptions(
+    select: HTMLSelectElement,
+    provider: string,
+    currentValue: string | null
+  ): Promise<void> {
+    select.innerHTML = "";
+    const inheritOpt = document.createElement("option");
+    inheritOpt.value = "";
+    inheritOpt.textContent = "inherit";
+    select.appendChild(inheritOpt);
+
+    let matched = !currentValue;
+    try {
+      const models = await listModels(provider === "auto" ? "all" : provider);
+      for (const m of models) {
+        const opt = document.createElement("option");
+        opt.value = m.id;
+        opt.textContent = m.name ? `${m.name} (${m.id})` : m.id;
+        if (m.id === currentValue) matched = true;
+        select.appendChild(opt);
+      }
+    } catch (e) {
+      console.error("Failed to list models:", e);
+    }
+
+    if (!matched && currentValue) {
+      const opt = document.createElement("option");
+      opt.value = currentValue;
+      opt.textContent = currentValue;
+      select.insertBefore(opt, select.firstChild!.nextSibling);
+    }
+    select.value = currentValue || "";
+  }
+
+  async function applyPartial(partial: Parameters<typeof updateConfig>[0]): Promise<void> {
+    try {
+      const config = await updateConfig(partial);
+      appState.update((s) => ({
+        ...s,
+        provider: config.provider,
+        model: config.model,
+        reasoningEffort: config.reasoning_effort,
+        recursive: config.recursive,
+        maxDepth: config.max_depth,
+        subtaskModel: config.subtask_model,
+        executeModel: config.execute_model,
+      }));
+    } catch (e) {
+      console.error("Failed to update config:", e);
+    }
+  }
+
+  providerSelect.addEventListener("change", () => {
+    const provider = providerSelect.value;
+    refreshModelOptions(provider, appState.get().model);
+    applyPartial({ provider });
+  });
+
+  modelSelect.addEventListener("change", () => {
+    syncModelIdRowVisibility();
+    if (modelSelect.value === "__custom__") {
+      modelCustomInput.focus();
+      return;
+    }
+    applyPartial({ model: modelSelect.value });
+  });
+
+  modelCustomInput.addEventListener("change", () => {
+    const value = modelCustomInput.value.trim();
+    if (value) applyPartial({ model: value });
+  });
+
+  reasoningSelect.addEventListener("change", () => {
+    applyPartial({ reasoning_effort: reasoningSelect.value });
+  });
+
+  recursiveCheckbox.addEventListener("change", () => {
+    applyPartial({ recursive: recursiveCheckbox.checked });
+  });
+
+  maxDepthInput.addEventListener("change", () => {
+    const n = parseInt(maxDepthInput.value, 10);
+    if (!Number.isNaN(n) && n > 0) applyPartial({ max_depth: n });
+  });
+
+  subtaskModelSelect.addEventListener("change", () => {
+    applyPartial({ subtask_model: subtaskModelSelect.value });
+  });
+
+  executeModelSelect.addEventListener("change", () => {
+    applyPartial({ execute_model: executeModelSelect.value });
+  });
+
+  // Last-rendered snapshot so unrelated appState updates (e.g. token counts
+  // ticking during a run) don't overwrite in-progress edits in these controls.
+  let last = {
+    provider: "",
+    model: "",
+    reasoningEffort: null as string | null,
+    recursive: true,
+    maxDepth: 0,
+    subtaskModel: null as string | null,
+    executeModel: null as string | null,
+  };
+  let modelOptionsLoadedFor = "";
+  let tierModelOptionsLoadedFor = "";
+
+  function render(): void {
+    const s = appState.get();
+    if (s.provider !== last.provider) {
+      providerSelect.value = PROVIDERS.includes(s.provider) ? s.provider : "auto";
+    }
+    if (s.provider !== modelOptionsLoadedFor || s.model !== last.model) {
+      modelOptionsLoadedFor = s.provider;
+      refreshModelOptions(s.provider, s.model);
+    }
+    if (
+      s.provider !== tierModelOptionsLoadedFor ||
+      s.subtaskModel !== last.subtaskModel ||
+      s.executeModel !== last.executeModel
+    ) {
+      tierModelOptionsLoadedFor = s.provider;
+      refreshTierModelOptions(subtaskModelSelect, s.provider, s.subtaskModel);
+      refreshTierModelOptions(executeModelSelect, s.provider, s.executeModel);
+    }
+    if (s.reasoningEffort !== last.reasoningEffort) {
+      reasoningSelect.value = s.reasoningEffort ?? "";
+    }
+    if (s.recursive !== last.recursive) {
+      recursiveCheckbox.checked = s.recursive;
+    }
+    if (s.maxDepth !== last.maxDepth) {
+      maxDepthInput.value = String(s.maxDepth);
+    }
+    last = {
+      provider: s.provider,
+      model: s.model,
+      reasoningEffort: s.reasoningEffort,
+      recursive: s.recursive,
+      maxDepth: s.maxDepth,
+      subtaskModel: s.subtaskModel,
+      executeModel: s.executeModel,
+    };
+  }
+
+  return {
+    elements: {
+      providerSelect,
+      modelSelect,
+      reasoningSelect,
+      recursiveCheckbox,
+      maxDepthInput,
+      subtaskModelSelect,
+      executeModelSelect,
+    },
+    render,
+  };
 }
 
 /** Switch to a new session, clearing chat state. */
@@ -96,6 +465,8 @@ async function switchToNewSession(sessionList: HTMLElement): Promise<void> {
       messages: [],
       inputTokens: 0,
       outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
       currentStep: 0,
       currentDepth: 0,
       inputQueue: [],
@@ -153,6 +524,8 @@ async function switchToSession(sessionId: string, sessionList: HTMLElement): Pro
       messages: [],
       inputTokens: 0,
       outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
       currentStep: 0,
       currentDepth: 0,
       inputQueue: [],
@@ -296,19 +669,153 @@ async function loadSessions(container: HTMLElement): Promise<void> {
   }
 }
 
+/** Open a native folder picker and switch the active workspace to the chosen directory. */
+async function openWorkspacePicker(
+  workspaceLabel: HTMLElement,
+  sessionList: HTMLElement,
+  credsDisplay: HTMLElement
+): Promise<void> {
+  try {
+    const selected = await open({ directory: true, multiple: false });
+    if (!selected || typeof selected !== "string") {
+      return; // user cancelled
+    }
+
+    const config = await setWorkspace(selected);
+    appState.update((s) => ({
+      ...s,
+      provider: config.provider,
+      model: config.model,
+      sessionId: config.session_id,
+      reasoningEffort: config.reasoning_effort,
+      recursive: config.recursive,
+      workspace: config.workspace,
+      maxDepth: config.max_depth,
+      maxStepsPerCall: config.max_steps_per_call,
+      messages: [],
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      currentStep: 0,
+      currentDepth: 0,
+      inputQueue: [],
+    }));
+
+    // Clear chat DOM and refresh sessions, credentials, and the wiki graph
+    window.dispatchEvent(new CustomEvent("session-changed", { detail: { isNew: true } }));
+    await loadSessions(sessionList);
+    await loadCredentials(credsDisplay);
+    window.dispatchEvent(new CustomEvent("curator-done"));
+  } catch (e) {
+    console.error("Failed to switch workspace:", e);
+  }
+}
+
 async function loadCredentials(container: HTMLElement): Promise<void> {
   try {
     const status = await getCredentialsStatus();
-    container.innerHTML = "";
-    const providers = ["openai", "anthropic", "openrouter", "cerebras", "ollama", "exa"];
-    for (const p of providers) {
-      const row = document.createElement("div");
-      const hasKey = status[p] ?? false;
-      row.className = hasKey ? "cred-ok" : "cred-missing";
-      row.textContent = `${hasKey ? "\u2713" : "\u2717"} ${p}`;
-      container.appendChild(row);
-    }
+    renderCredentials(container, status);
   } catch (e) {
     console.error("Failed to load credentials:", e);
+  }
+}
+
+function renderCredentials(container: HTMLElement, status: Record<string, boolean>): void {
+  container.innerHTML = "";
+  for (const p of CRED_PROVIDERS) {
+    const row = document.createElement("div");
+    row.className = "cred-row";
+
+    const hasKey = status[p] ?? false;
+    const statusEl = document.createElement("span");
+    statusEl.className = hasKey ? "cred-ok" : "cred-missing";
+
+    const dot = document.createElement("span");
+    dot.className = `cred-status-dot ${hasKey ? "ok" : "missing"}`;
+    const name = document.createElement("span");
+    name.className = "cred-name";
+    name.textContent = p;
+    statusEl.append(dot, name);
+    row.appendChild(statusEl);
+
+    if (p === "ollama") {
+      // Ollama never needs a key \u2014 no Set control.
+      const note = document.createElement("span");
+      note.className = "cred-local-note";
+      note.textContent = "local, no key";
+      row.appendChild(note);
+      container.appendChild(row);
+      continue;
+    }
+
+    const setBtn = document.createElement("button");
+    setBtn.className = "cred-set-btn btn";
+    setBtn.textContent = "Set\u2026";
+
+    const form = document.createElement("div");
+    form.className = "cred-set-form";
+    form.style.display = "none";
+
+    const input = document.createElement("input");
+    input.type = "password";
+    input.className = "cred-set-input";
+    input.placeholder = `${p} API key`;
+    input.autocomplete = "off";
+
+    const saveBtn = document.createElement("button");
+    saveBtn.className = "cred-save-btn btn";
+    saveBtn.textContent = "Save";
+
+    const cancelBtn = document.createElement("button");
+    cancelBtn.className = "cred-cancel-btn btn";
+    cancelBtn.textContent = "Cancel";
+
+    form.append(input, saveBtn, cancelBtn);
+    row.append(setBtn, form);
+
+    function openForm(): void {
+      form.style.display = "flex";
+      input.focus();
+    }
+
+    function closeForm(): void {
+      form.style.display = "none";
+      input.value = "";
+    }
+
+    setBtn.addEventListener("click", () => {
+      const opening = form.style.display === "none";
+      if (opening) openForm();
+      else closeForm();
+    });
+
+    cancelBtn.addEventListener("click", () => closeForm());
+
+    async function doSave(): Promise<void> {
+      const value = input.value.trim();
+      if (!value) return;
+      saveBtn.disabled = true;
+      saveBtn.textContent = "Saving\u2026";
+      try {
+        const newStatus = await setCredential(p, value);
+        // Never leave the entered value in the DOM.
+        input.value = "";
+        form.style.display = "none";
+        renderCredentials(container, newStatus);
+      } catch (e) {
+        console.error(`Failed to save credential for ${p}:`, e);
+        saveBtn.disabled = false;
+        saveBtn.textContent = "Save";
+      }
+    }
+
+    saveBtn.addEventListener("click", () => void doSave());
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") void doSave();
+      if (e.key === "Escape") closeForm();
+    });
+
+    container.appendChild(row);
   }
 }

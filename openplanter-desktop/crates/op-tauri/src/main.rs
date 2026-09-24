@@ -10,6 +10,7 @@ use state::AppState;
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(AppState::new())
         .invoke_handler(tauri::generate_handler![
             commands::agent::solve,
@@ -17,9 +18,11 @@ fn main() {
             commands::agent::debug_log,
             commands::config::get_config,
             commands::config::update_config,
+            commands::config::set_workspace,
             commands::config::list_models,
             commands::config::save_settings,
             commands::config::get_credentials_status,
+            commands::config::set_credential,
             commands::session::list_sessions,
             commands::session::open_session,
             commands::session::delete_session,
