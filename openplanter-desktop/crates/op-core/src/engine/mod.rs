@@ -208,6 +208,27 @@ pub(crate) fn strip_trailing_done(text: &str) -> Option<String> {
     }
 }
 
+/// Observation injected in place of a truncated turn's tool call result(s)
+/// (or as a plain nudge, if there were no tool calls) when a model turn ends
+/// with `ModelTurn::truncated == true` — Anthropic `stop_reason ==
+/// "max_tokens"`, or OpenAI-shaped `finish_reason == "length"`.
+///
+/// A live run showed a depth-0 step end with `step_tokens_out == 16384`
+/// (the old hard-coded `max_tokens`) mid-`write_file` tool call: the call's
+/// JSON arguments were truncated, the file never landed, and the run ended
+/// silently. Any tool call(s) on a truncated turn must NOT be executed
+/// as-is — their `arguments` may be incomplete/corrupt JSON — so this is
+/// returned as the tool result observation instead, and the loop continues
+/// (this counts as one step against the budget, same as any other turn).
+pub(crate) fn truncated_turn_message(max_output_tokens: u64) -> String {
+    format!(
+        "Your previous output was cut off at the max_tokens limit ({max_output_tokens}). \
+         Write large files in chunks: write_file the first part, then edit_file/append the \
+         rest. Keep each tool call under ~{} tokens.",
+        max_output_tokens / 2
+    )
+}
+
 /// Decide whether a text-only (no tool calls) turn is final, given whether
 /// the one-time completion nudge has already been sent this loop.
 ///
@@ -224,6 +245,66 @@ pub(crate) fn resolve_text_only_turn(text: &str, already_nudged: bool) -> Option
         Some(text.to_string())
     } else {
         None
+    }
+}
+
+/// Ensure every `tool_use`/tool-call block on an assistant turn has a
+/// matching tool-result message before the next non-tool message. Providers
+/// (Anthropic in particular) reject a request where a `tool_use` has no
+/// matching `tool_result` — a session can end up in this state if a turn's
+/// tool-result never got appended (e.g. the truncation guard didn't fire on
+/// an older run, or a session was resumed mid-poisoned-state). Inserts a
+/// synthetic tool-result so the session can continue instead of erroring on
+/// every subsequent turn.
+///
+/// Disclosed simplification: the synthetic result is plain text content, not
+/// a `tool_result` block with `is_error: true` — `Message::Tool` has no
+/// `is_error` field, and adding one would touch every construction site of
+/// this enum variant across the codebase. The content text alone is enough
+/// to stop the 400; the model still sees the call as unsuccessful (see the
+/// wording below).
+pub(crate) fn sanitize_orphaned_tool_calls(messages: &mut Vec<Message>) {
+    let mut i = 0;
+    while i < messages.len() {
+        let tool_call_ids: Option<Vec<String>> = match &messages[i] {
+            Message::Assistant {
+                tool_calls: Some(tcs),
+                ..
+            } if !tcs.is_empty() => Some(tcs.iter().map(|tc| tc.id.clone()).collect()),
+            _ => None,
+        };
+        let Some(tool_call_ids) = tool_call_ids else {
+            i += 1;
+            continue;
+        };
+
+        // Tool-result messages immediately following this assistant turn.
+        let mut answered: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut j = i + 1;
+        while j < messages.len() {
+            match &messages[j] {
+                Message::Tool { tool_call_id, .. } => {
+                    answered.insert(tool_call_id.clone());
+                    j += 1;
+                }
+                _ => break,
+            }
+        }
+
+        let mut insert_pos = j;
+        for id in &tool_call_ids {
+            if !answered.contains(id) {
+                messages.insert(
+                    insert_pos,
+                    Message::Tool {
+                        tool_call_id: id.clone(),
+                        content: "tool call was truncated".to_string(),
+                    },
+                );
+                insert_pos += 1;
+            }
+        }
+        i = insert_pos;
     }
 }
 
@@ -361,6 +442,10 @@ pub async fn solve(
         // Compact context if it's grown too large (~100k token budget)
         compact_messages(&mut messages, 100_000);
 
+        // Guard against a poisoned history (an orphaned tool_use with no
+        // matching tool_result) 400ing every subsequent turn.
+        sanitize_orphaned_tool_calls(&mut messages);
+
         // Call model with streaming
         let turn = match model
             .chat_stream(&messages, &tool_defs, &|delta| emitter.emit_delta(delta), &cancel)
@@ -390,6 +475,38 @@ pub async fn solve(
             content: turn.text.clone(),
             tool_calls: tool_calls_opt,
         });
+
+        // Turn was cut off at the provider's output token limit. Any tool
+        // call(s) may have incomplete/corrupt JSON arguments — do not execute
+        // them. Inject the cut-off observation and continue instead of
+        // falling into the normal tool-execution / text-only branches below.
+        if turn.truncated {
+            emitter.emit_step(StepEvent {
+                depth: 0,
+                step: step as u32,
+                tool_name: turn.tool_calls.first().map(|tc| tc.name.clone()),
+                tokens: TokenUsage {
+                    input_tokens: turn.input_tokens,
+                    output_tokens: turn.output_tokens,
+                    cache_creation_input_tokens: turn.cache_creation_input_tokens.unwrap_or(0),
+                    cache_read_input_tokens: turn.cache_read_input_tokens.unwrap_or(0),
+                },
+                elapsed_ms: step_start.elapsed().as_millis() as u64,
+                is_final: false,
+            });
+            let notice = truncated_turn_message(config.max_output_tokens);
+            if turn.tool_calls.is_empty() {
+                messages.push(Message::User { content: notice });
+            } else {
+                for tc in &turn.tool_calls {
+                    messages.push(Message::Tool {
+                        tool_call_id: tc.id.clone(),
+                        content: notice.clone(),
+                    });
+                }
+            }
+            continue;
+        }
 
         // No tool calls + text present: matches agent/engine.py::_solve_recursive
         // ("No tool calls + text present = final answer", engine.py:442-463),
@@ -571,6 +688,7 @@ pub async fn solve(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::ToolCall;
     use std::sync::{Arc, Mutex};
 
     #[derive(Debug, Clone)]
@@ -823,6 +941,118 @@ mod tests {
         let tokens = estimate_tokens(&messages);
         // (13 + 5 + 4000) / 4 = 1004
         assert_eq!(tokens, 1004);
+    }
+
+    // ── sanitize_orphaned_tool_calls ──
+
+    #[test]
+    fn test_sanitize_orphaned_tool_calls_inserts_missing_result() {
+        let mut messages = vec![
+            Message::User { content: "write a big file".into() },
+            Message::Assistant {
+                content: String::new(),
+                tool_calls: Some(vec![ToolCall {
+                    id: "tc1".into(),
+                    name: "write_file".into(),
+                    arguments: "{\"path\":\"x\"".into(), // truncated JSON
+                }]),
+            },
+            // No matching Message::Tool — the tool_result never got appended.
+            Message::User { content: "next objective".into() },
+        ];
+
+        sanitize_orphaned_tool_calls(&mut messages);
+
+        assert_eq!(messages.len(), 4, "expected a synthetic tool_result inserted");
+        match &messages[2] {
+            Message::Tool { tool_call_id, content } => {
+                assert_eq!(tool_call_id, "tc1");
+                assert_eq!(content, "tool call was truncated");
+            }
+            other => panic!("expected Message::Tool at index 2, got {other:?}"),
+        }
+        // The message after the injected result is untouched.
+        assert!(matches!(&messages[3], Message::User { content } if content == "next objective"));
+    }
+
+    #[test]
+    fn test_sanitize_orphaned_tool_calls_fills_only_the_missing_one_of_several() {
+        let mut messages = vec![
+            Message::Assistant {
+                content: String::new(),
+                tool_calls: Some(vec![
+                    ToolCall { id: "tc1".into(), name: "read_file".into(), arguments: "{}".into() },
+                    ToolCall { id: "tc2".into(), name: "write_file".into(), arguments: "{}".into() },
+                ]),
+            },
+            // Only tc1 was answered — tc2's result never landed.
+            Message::Tool { tool_call_id: "tc1".into(), content: "file contents".into() },
+        ];
+
+        sanitize_orphaned_tool_calls(&mut messages);
+
+        assert_eq!(messages.len(), 3);
+        match &messages[2] {
+            Message::Tool { tool_call_id, content } => {
+                assert_eq!(tool_call_id, "tc2");
+                assert_eq!(content, "tool call was truncated");
+            }
+            other => panic!("expected synthetic Message::Tool for tc2, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_sanitize_orphaned_tool_calls_no_op_when_fully_answered() {
+        let mut messages = vec![
+            Message::Assistant {
+                content: String::new(),
+                tool_calls: Some(vec![ToolCall { id: "tc1".into(), name: "read_file".into(), arguments: "{}".into() }]),
+            },
+            Message::Tool { tool_call_id: "tc1".into(), content: "ok".into() },
+            Message::Assistant { content: "done\nDONE".into(), tool_calls: None },
+        ];
+        let before = messages.len();
+
+        sanitize_orphaned_tool_calls(&mut messages);
+
+        assert_eq!(messages.len(), before, "fully-answered history must be untouched");
+    }
+
+    #[test]
+    fn test_sanitize_orphaned_tool_calls_no_op_on_text_only_history() {
+        let mut messages = vec![
+            Message::System { content: "sys".into() },
+            Message::User { content: "hi".into() },
+            Message::Assistant { content: "hello\nDONE".into(), tool_calls: None },
+        ];
+        let before = messages.clone();
+
+        sanitize_orphaned_tool_calls(&mut messages);
+
+        assert_eq!(messages.len(), before.len());
+    }
+
+    #[test]
+    fn test_sanitize_orphaned_tool_calls_handles_consecutive_poisoned_turns() {
+        // Two assistant turns in a row (not realistic in practice, but the
+        // function must not confuse one turn's missing result with another's).
+        let mut messages = vec![
+            Message::Assistant {
+                content: String::new(),
+                tool_calls: Some(vec![ToolCall { id: "a1".into(), name: "read_file".into(), arguments: "{}".into() }]),
+            },
+            Message::Assistant {
+                content: String::new(),
+                tool_calls: Some(vec![ToolCall { id: "b1".into(), name: "write_file".into(), arguments: "{}".into() }]),
+            },
+        ];
+
+        sanitize_orphaned_tool_calls(&mut messages);
+
+        // Expect: [Assistant a1, Tool a1, Assistant b1, Tool b1]
+        assert_eq!(messages.len(), 4);
+        assert!(matches!(&messages[1], Message::Tool { tool_call_id, .. } if tool_call_id == "a1"));
+        assert!(matches!(&messages[3], Message::Tool { tool_call_id, .. } if tool_call_id == "b1"));
     }
 
     #[test]

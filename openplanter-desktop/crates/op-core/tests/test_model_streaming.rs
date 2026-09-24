@@ -170,6 +170,37 @@ async fn test_openai_stream_tool_call() {
         .map(|d| d.text.as_str())
         .collect();
     assert_eq!(tool_start, vec!["read_file"]);
+    assert!(!turn.truncated, "finish_reason \"tool_calls\" must not be reported as truncated");
+}
+
+const OPENAI_SSE_TRUNCATED_TOOL_CALL: &str = "\
+data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call_trunc\",\"type\":\"function\",\"function\":{\"name\":\"write_file\",\"arguments\":\"\"}}]},\"index\":0}]}\n\n\
+data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"path\\\":\\\"big.txt\\\",\\\"content\\\":\\\"partial\"}}]},\"index\":0}]}\n\n\
+data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\",\"index\":0}],\"usage\":{\"prompt_tokens\":40,\"completion_tokens\":32768}}\n\n\
+data: [DONE]\n\n";
+
+#[tokio::test]
+async fn test_openai_stream_truncated_tool_call_sets_truncated_flag() {
+    let addr = start_mock_sse_server(OPENAI_SSE_TRUNCATED_TOOL_CALL).await;
+    let model = OpenAIModel::new(
+        "gpt-4o".to_string(),
+        "openai".to_string(),
+        format!("http://{addr}"),
+        "test-key".to_string(),
+        None,
+        HashMap::new(),
+    );
+
+    let cancel = CancellationToken::new();
+    let turn = model
+        .chat_stream(&simple_messages(), &[], &|_| {}, &cancel)
+        .await
+        .expect("chat_stream should succeed even on a truncated turn");
+
+    assert!(turn.truncated, "finish_reason \"length\" must set truncated = true");
+    assert_eq!(turn.tool_calls.len(), 1);
+    assert_eq!(turn.tool_calls[0].name, "write_file");
+    assert!(serde_json::from_str::<serde_json::Value>(&turn.tool_calls[0].arguments).is_err());
 }
 
 #[tokio::test]
@@ -214,6 +245,7 @@ async fn test_anthropic_stream_text() {
         format!("http://{addr}"),
         "test-key".to_string(),
         None,
+        16384,
     );
 
     let collector = DeltaCollector::new();
@@ -258,6 +290,7 @@ async fn test_anthropic_stream_thinking() {
         format!("http://{addr}"),
         "test-key".to_string(),
         Some("high".to_string()),
+        16384,
     );
 
     let collector = DeltaCollector::new();
@@ -299,6 +332,7 @@ async fn test_anthropic_stream_tool_call() {
         format!("http://{addr}"),
         "test-key".to_string(),
         None,
+        16384,
     );
 
     let collector = DeltaCollector::new();
@@ -313,6 +347,40 @@ async fn test_anthropic_stream_tool_call() {
     assert_eq!(turn.tool_calls[0].id, "toolu_1");
     assert_eq!(turn.tool_calls[0].name, "read_file");
     assert_eq!(turn.tool_calls[0].arguments, "{\"path\":\"test.txt\"}");
+    assert!(!turn.truncated, "stop_reason \"tool_use\" must not be reported as truncated");
+}
+
+const ANTHROPIC_SSE_TRUNCATED_TOOL: &str = "\
+event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_4\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":50}}}\n\n\
+event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_trunc\",\"name\":\"write_file\",\"input\":{}}}\n\n\
+event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"big.txt\\\",\\\"content\\\":\\\"partial data that never clo\"}}\n\n\
+event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"usage\":{\"output_tokens\":16384}}\n\n\
+event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+
+#[tokio::test]
+async fn test_anthropic_stream_truncated_tool_call_sets_truncated_flag() {
+    let addr = start_mock_sse_server(ANTHROPIC_SSE_TRUNCATED_TOOL).await;
+    let model = AnthropicModel::new(
+        "claude-sonnet-4-5".to_string(),
+        format!("http://{addr}"),
+        "test-key".to_string(),
+        None,
+        16384,
+    );
+
+    let cancel = CancellationToken::new();
+    let turn = model
+        .chat(&simple_messages(), &[])
+        .await
+        .expect("chat_stream should succeed even on a truncated turn");
+
+    assert!(turn.truncated, "stop_reason \"max_tokens\" must set truncated = true");
+    assert_eq!(turn.tool_calls.len(), 1);
+    assert_eq!(turn.tool_calls[0].name, "write_file");
+    // The arguments string is genuinely truncated mid-JSON — not valid JSON.
+    assert!(serde_json::from_str::<serde_json::Value>(&turn.tool_calls[0].arguments).is_err());
+    let _ = cancel;
 }
 
 #[tokio::test]
@@ -323,6 +391,7 @@ async fn test_anthropic_stream_cancel() {
         format!("http://{addr}"),
         "test-key".to_string(),
         None,
+        16384,
     );
 
     let cancel = CancellationToken::new();
@@ -363,6 +432,7 @@ async fn test_anthropic_chat_non_streaming() {
         format!("http://{addr}"),
         "test-key".to_string(),
         None,
+        16384,
     );
 
     let turn = model.chat(&simple_messages(), &[]).await.expect("chat should succeed");
@@ -393,6 +463,12 @@ async fn test_openai_http_error() {
         .await;
 
     assert!(result.is_err(), "should fail with HTTP error");
+    let msg = result.unwrap_err().to_string();
+    assert!(msg.contains("401"), "error should include the status code, got: {msg}");
+    assert!(
+        msg.contains("Invalid API key"),
+        "error should include the response body, not just the status, got: {msg}"
+    );
 }
 
 #[tokio::test]
@@ -406,6 +482,7 @@ async fn test_anthropic_http_error() {
         format!("http://{addr}"),
         "bad-key".to_string(),
         None,
+        16384,
     );
 
     let cancel = CancellationToken::new();
@@ -414,6 +491,12 @@ async fn test_anthropic_http_error() {
         .await;
 
     assert!(result.is_err(), "should fail with HTTP error");
+    let msg = result.unwrap_err().to_string();
+    assert!(msg.contains("401"), "error should include the status code, got: {msg}");
+    assert!(
+        msg.contains("invalid x-api-key"),
+        "error should include the response body, not just the status, got: {msg}"
+    );
 }
 
 // ─── Full solve() integration test ───
@@ -1002,5 +1085,109 @@ async fn test_solve_multi_step_agentic_loop() {
         errors.is_empty(),
         "should not have any errors, got: {:?}",
         errors
+    );
+}
+
+/// SSE body for a turn cut off mid-tool-call by the max_tokens limit: the
+/// `write_file` call's JSON `arguments` never close, and `stop_reason` is
+/// `"max_tokens"` instead of `"tool_use"`.
+const ANTHROPIC_SSE_TRUNCATED_WRITE: &str = "\
+event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_trunc1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":60}}}\n\n\
+event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_trunc1\",\"name\":\"write_file\",\"input\":{}}}\n\n\
+event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"out.txt\\\",\\\"content\\\":\\\"never clo\"}}\n\n\
+event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"usage\":{\"output_tokens\":16384}}\n\n\
+event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+
+#[tokio::test]
+async fn test_solve_recovers_from_truncated_tool_call() {
+    use op_core::config::AgentConfig;
+    use op_core::engine::{solve, SolveEmitter};
+    use op_core::events::StepEvent;
+
+    // Mock server: first call → truncated write_file tool call, second call
+    // → a clean final answer. If solve() tried to execute the truncated
+    // tool call's corrupt JSON as-is, this would either panic/error out or
+    // silently end the run instead of reaching the second turn.
+    let addr = start_stateful_mock_server(vec![
+        ANTHROPIC_SSE_TRUNCATED_WRITE,
+        ANTHROPIC_SSE_FINAL_ANSWER,
+    ]).await;
+
+    #[derive(Debug, Clone)]
+    #[allow(dead_code)]
+    enum Ev5 {
+        Trace(String),
+        Delta(DeltaEvent),
+        Step(StepEvent),
+        Complete(String),
+        Error(String),
+    }
+
+    struct TestEmitter5 {
+        events: Arc<Mutex<Vec<Ev5>>>,
+    }
+    impl SolveEmitter for TestEmitter5 {
+        fn emit_trace(&self, message: &str) {
+            self.events.lock().unwrap().push(Ev5::Trace(message.to_string()));
+        }
+        fn emit_delta(&self, event: DeltaEvent) {
+            self.events.lock().unwrap().push(Ev5::Delta(event));
+        }
+        fn emit_step(&self, event: StepEvent) {
+            self.events.lock().unwrap().push(Ev5::Step(event));
+        }
+        fn emit_complete(&self, result: &str) {
+            self.events.lock().unwrap().push(Ev5::Complete(result.to_string()));
+        }
+        fn emit_error(&self, message: &str) {
+            self.events.lock().unwrap().push(Ev5::Error(message.to_string()));
+        }
+    }
+
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let emitter = TestEmitter5 { events: events.clone() };
+    let tmp = tempfile::TempDir::new().unwrap();
+
+    let cfg = AgentConfig {
+        provider: "anthropic".into(),
+        model: "claude-sonnet-4-5".into(),
+        anthropic_api_key: Some("test-key".into()),
+        anthropic_base_url: format!("http://{addr}"),
+        demo: false,
+        workspace: tmp.path().to_path_buf(),
+        max_output_tokens: 16384,
+        ..Default::default()
+    };
+
+    let cancel = CancellationToken::new();
+    solve("Write a large file", &cfg, &emitter, cancel).await;
+
+    let recorded = events.lock().unwrap().clone();
+
+    // Must reach Complete via the SECOND (follow-up) turn — proves the
+    // truncated tool call was not executed as-is and the loop continued
+    // to a real recovery turn instead of erroring or silently ending.
+    assert!(
+        recorded.iter().any(|e| matches!(e, Ev5::Complete(t) if t.contains("I found the files"))),
+        "expected solve() to recover from the truncated turn and finish on the follow-up turn, got: {:?}",
+        recorded
+    );
+
+    // The first step (the truncated turn) must be emitted as non-final.
+    let steps: Vec<&StepEvent> = recorded
+        .iter()
+        .filter_map(|e| match e {
+            Ev5::Step(s) => Some(s),
+            _ => None,
+        })
+        .collect();
+    assert!(steps.len() >= 2, "expected at least 2 steps, got {}", steps.len());
+    assert!(!steps[0].is_final, "the truncated turn's step must be non-final");
+
+    assert!(
+        !recorded.iter().any(|e| matches!(e, Ev5::Error(_))),
+        "should not error out on a truncated tool call, got: {:?}",
+        recorded
     );
 }

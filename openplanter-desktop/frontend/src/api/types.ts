@@ -76,6 +76,8 @@ export interface ConfigView {
   subtask_model: string | null;
   execute_model: string | null;
   max_exa_agent_calls: number;
+  max_output_tokens: number;
+  exa_agent_timeout_sec: number;
 }
 
 export interface PartialConfig {
@@ -89,6 +91,8 @@ export interface PartialConfig {
   /** Empty string clears the override back to "inherit". */
   execute_model?: string;
   max_exa_agent_calls?: number;
+  max_output_tokens?: number;
+  exa_agent_timeout_sec?: number;
 }
 
 export interface ModelInfo {

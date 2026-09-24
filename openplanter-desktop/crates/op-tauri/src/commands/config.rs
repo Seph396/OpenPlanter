@@ -25,6 +25,8 @@ pub struct PartialConfig {
     /// `Some("")` clears the override back to "inherit"; `None` leaves it unchanged.
     pub execute_model: Option<String>,
     pub max_exa_agent_calls: Option<u32>,
+    pub max_output_tokens: Option<u64>,
+    pub exa_agent_timeout_sec: Option<u64>,
 }
 
 /// Get the current configuration.
@@ -47,6 +49,8 @@ pub async fn get_config(
         subtask_model: cfg.subtask_model.clone(),
         execute_model: cfg.execute_model.clone(),
         max_exa_agent_calls: cfg.max_exa_agent_calls,
+        max_output_tokens: cfg.max_output_tokens,
+        exa_agent_timeout_sec: cfg.exa_agent_timeout_sec,
     })
 }
 
@@ -80,6 +84,12 @@ pub fn apply_partial_config(cfg: &mut op_core::config::AgentConfig, partial: Par
     if let Some(max_exa_agent_calls) = partial.max_exa_agent_calls {
         cfg.max_exa_agent_calls = max_exa_agent_calls;
     }
+    if let Some(max_output_tokens) = partial.max_output_tokens {
+        cfg.max_output_tokens = max_output_tokens;
+    }
+    if let Some(exa_agent_timeout_sec) = partial.exa_agent_timeout_sec {
+        cfg.exa_agent_timeout_sec = exa_agent_timeout_sec;
+    }
 }
 
 /// Update configuration fields.
@@ -101,6 +111,8 @@ pub async fn update_config(
         subtask_model: cfg.subtask_model.clone(),
         execute_model: cfg.execute_model.clone(),
         max_exa_agent_calls: Some(cfg.max_exa_agent_calls),
+        max_output_tokens: Some(cfg.max_output_tokens),
+        exa_agent_timeout_sec: Some(cfg.exa_agent_timeout_sec),
     };
     if let Err(e) = save_ui_prefs(&cfg.workspace, &prefs) {
         eprintln!("[config] failed to persist UI prefs: {e}");
@@ -120,6 +132,8 @@ pub async fn update_config(
         subtask_model: cfg.subtask_model.clone(),
         execute_model: cfg.execute_model.clone(),
         max_exa_agent_calls: cfg.max_exa_agent_calls,
+        max_output_tokens: cfg.max_output_tokens,
+        exa_agent_timeout_sec: cfg.exa_agent_timeout_sec,
     })
 }
 
@@ -255,6 +269,8 @@ pub async fn set_workspace(
         subtask_model: cfg.subtask_model.clone(),
         execute_model: cfg.execute_model.clone(),
         max_exa_agent_calls: cfg.max_exa_agent_calls,
+        max_output_tokens: cfg.max_output_tokens,
+        exa_agent_timeout_sec: cfg.exa_agent_timeout_sec,
     })
 }
 
@@ -522,6 +538,25 @@ mod tests {
     }
 
     #[test]
+    fn test_apply_partial_config_max_output_tokens() {
+        let mut cfg = op_core::config::AgentConfig::from_env("/nonexistent");
+        cfg.max_output_tokens = 32768;
+
+        apply_partial_config(
+            &mut cfg,
+            PartialConfig {
+                max_output_tokens: Some(8192),
+                ..Default::default()
+            },
+        );
+        assert_eq!(cfg.max_output_tokens, 8192);
+
+        // None leaves it unchanged.
+        apply_partial_config(&mut cfg, PartialConfig::default());
+        assert_eq!(cfg.max_output_tokens, 8192);
+    }
+
+    #[test]
     fn test_apply_partial_config_none_fields_preserve_existing() {
         let mut cfg = op_core::config::AgentConfig::from_env("/nonexistent");
         cfg.recursive = true;
@@ -550,6 +585,8 @@ mod tests {
                 subtask_model: Some("claude-sonnet-5".to_string()),
                 execute_model: Some("claude-haiku-4-5".to_string()),
                 max_exa_agent_calls: Some(20),
+                max_output_tokens: Some(65536),
+                exa_agent_timeout_sec: Some(180),
             },
         );
 
@@ -558,9 +595,30 @@ mod tests {
         assert_eq!(cfg.reasoning_effort, Some("medium".to_string()));
         assert!(!cfg.recursive);
         assert_eq!(cfg.max_depth, 2);
+        assert_eq!(cfg.max_output_tokens, 65536);
         assert_eq!(cfg.subtask_model, Some("claude-sonnet-5".to_string()));
         assert_eq!(cfg.execute_model, Some("claude-haiku-4-5".to_string()));
         assert_eq!(cfg.max_exa_agent_calls, 20);
+        assert_eq!(cfg.exa_agent_timeout_sec, 180);
+    }
+
+    #[test]
+    fn test_apply_partial_config_exa_agent_timeout_sec() {
+        let mut cfg = op_core::config::AgentConfig::from_env("/nonexistent");
+        cfg.exa_agent_timeout_sec = 300;
+
+        apply_partial_config(
+            &mut cfg,
+            PartialConfig {
+                exa_agent_timeout_sec: Some(120),
+                ..Default::default()
+            },
+        );
+        assert_eq!(cfg.exa_agent_timeout_sec, 120);
+
+        // None leaves it unchanged.
+        apply_partial_config(&mut cfg, PartialConfig::default());
+        assert_eq!(cfg.exa_agent_timeout_sec, 120);
     }
 
     #[test]

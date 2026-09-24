@@ -87,6 +87,10 @@ pub struct UiPrefs {
     pub execute_model: Option<String>,
     #[serde(default)]
     pub max_exa_agent_calls: Option<u32>,
+    #[serde(default)]
+    pub max_output_tokens: Option<u64>,
+    #[serde(default)]
+    pub exa_agent_timeout_sec: Option<u64>,
 }
 
 fn ui_prefs_path(workspace: &Path) -> PathBuf {
@@ -142,6 +146,12 @@ fn apply_ui_prefs(cfg: &mut AgentConfig) {
     }
     if let Some(max_exa_agent_calls) = prefs.max_exa_agent_calls {
         cfg.max_exa_agent_calls = max_exa_agent_calls;
+    }
+    if let Some(max_output_tokens) = prefs.max_output_tokens {
+        cfg.max_output_tokens = max_output_tokens;
+    }
+    if let Some(exa_agent_timeout_sec) = prefs.exa_agent_timeout_sec {
+        cfg.exa_agent_timeout_sec = exa_agent_timeout_sec;
     }
 }
 
@@ -372,6 +382,8 @@ mod tests {
             subtask_model: Some("claude-sonnet-5".into()),
             execute_model: Some("claude-haiku-4-5".into()),
             max_exa_agent_calls: Some(20),
+            max_output_tokens: Some(65536),
+            exa_agent_timeout_sec: Some(180),
         };
         save_ui_prefs(dir.path(), &prefs).unwrap();
         let loaded = load_ui_prefs(dir.path());
@@ -383,6 +395,8 @@ mod tests {
         assert_eq!(loaded.subtask_model, Some("claude-sonnet-5".into()));
         assert_eq!(loaded.execute_model, Some("claude-haiku-4-5".into()));
         assert_eq!(loaded.max_exa_agent_calls, Some(20));
+        assert_eq!(loaded.max_output_tokens, Some(65536));
+        assert_eq!(loaded.exa_agent_timeout_sec, Some(180));
     }
 
     #[test]
@@ -406,6 +420,8 @@ mod tests {
             subtask_model: None,
             execute_model: None,
             max_exa_agent_calls: Some(7),
+            max_output_tokens: Some(4096),
+            exa_agent_timeout_sec: Some(90),
         };
         save_ui_prefs(dir.path(), &prefs).unwrap();
 
@@ -416,6 +432,8 @@ mod tests {
         assert!(!cfg.recursive);
         assert_eq!(cfg.max_depth, 9);
         assert_eq!(cfg.max_exa_agent_calls, 7);
+        assert_eq!(cfg.max_output_tokens, 4096);
+        assert_eq!(cfg.exa_agent_timeout_sec, 90);
     }
 
     // ── save_credential / Keychain arg builder ──

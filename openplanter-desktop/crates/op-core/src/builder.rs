@@ -270,6 +270,7 @@ pub fn build_model(cfg: &AgentConfig) -> Result<Box<dyn BaseModel>, ModelError> 
             base_url,
             api_key,
             cfg.reasoning_effort.clone(),
+            cfg.max_output_tokens,
         ))),
         _ => {
             // OpenAI-compatible: openai, openrouter, cerebras, ollama
@@ -281,13 +282,14 @@ pub fn build_model(cfg: &AgentConfig) -> Result<Box<dyn BaseModel>, ModelError> 
                 );
                 extra_headers.insert("X-Title".to_string(), "OpenPlanter".to_string());
             }
-            Ok(Box::new(OpenAIModel::new(
+            Ok(Box::new(OpenAIModel::with_max_output_tokens(
                 model_name,
                 provider,
                 base_url,
                 api_key,
                 cfg.reasoning_effort.clone(),
                 extra_headers,
+                cfg.max_output_tokens,
             )))
         }
     }

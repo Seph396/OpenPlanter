@@ -19,6 +19,7 @@ pub struct OpenAIModel {
     api_key: String,
     reasoning_effort: Option<String>,
     extra_headers: HashMap<String, String>,
+    max_output_tokens: u64,
 }
 
 impl OpenAIModel {
@@ -30,6 +31,19 @@ impl OpenAIModel {
         reasoning_effort: Option<String>,
         extra_headers: HashMap<String, String>,
     ) -> Self {
+        Self::with_max_output_tokens(model, provider, base_url, api_key, reasoning_effort, extra_headers, 32768)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_max_output_tokens(
+        model: String,
+        provider: String,
+        base_url: String,
+        api_key: String,
+        reasoning_effort: Option<String>,
+        extra_headers: HashMap<String, String>,
+        max_output_tokens: u64,
+    ) -> Self {
         Self {
             client: reqwest::Client::new(),
             model,
@@ -38,6 +52,7 @@ impl OpenAIModel {
             api_key,
             reasoning_effort,
             extra_headers,
+            max_output_tokens,
         }
     }
 
@@ -118,8 +133,13 @@ impl OpenAIModel {
             payload["tool_choice"] = serde_json::json!("auto");
         }
 
-        if !self.is_reasoning_model() {
+        if self.is_reasoning_model() {
+            // Reasoning models (o1/o3/o4/gpt-5*) reject the legacy `max_tokens`
+            // field and require `max_completion_tokens` instead.
+            payload["max_completion_tokens"] = serde_json::json!(self.max_output_tokens);
+        } else {
             payload["temperature"] = serde_json::json!(0.0);
+            payload["max_tokens"] = serde_json::json!(self.max_output_tokens);
         }
 
         if let Some(ref effort) = self.reasoning_effort {
@@ -172,6 +192,7 @@ impl BaseModel for OpenAIModel {
         let mut tool_calls_by_index: HashMap<usize, (String, String, String)> = HashMap::new(); // (id, name, args)
         let mut input_tokens: u64 = 0;
         let mut output_tokens: u64 = 0;
+        let mut finish_reason: Option<String> = None;
 
         use futures::StreamExt;
         loop {
@@ -191,6 +212,12 @@ impl BaseModel for OpenAIModel {
             let event = match event {
                 Some(Ok(ev)) => ev,
                 Some(Err(reqwest_eventsource::Error::StreamEnded)) => break,
+                Some(Err(reqwest_eventsource::Error::InvalidStatusCode(status, response))) => {
+                    es.close();
+                    let body = response.text().await.unwrap_or_default();
+                    let snippet: String = body.chars().take(600).collect();
+                    return Err(anyhow!("{} {status}: {snippet}", self.provider));
+                }
                 Some(Err(e)) => {
                     es.close();
                     return Err(anyhow!("SSE stream error: {e}"));
@@ -225,6 +252,10 @@ impl BaseModel for OpenAIModel {
 
                     if choices.is_empty() {
                         continue;
+                    }
+
+                    if let Some(fr) = choices[0].get("finish_reason").and_then(|v| v.as_str()) {
+                        finish_reason = Some(fr.to_string());
                     }
 
                     let delta = match choices[0].get("delta") {
@@ -300,6 +331,7 @@ impl BaseModel for OpenAIModel {
             output_tokens,
             cache_creation_input_tokens: None,
             cache_read_input_tokens: None,
+            truncated: finish_reason.as_deref() == Some("length"),
         })
     }
 
@@ -430,6 +462,48 @@ mod tests {
         let payload = model.build_payload(&msgs, &[], true);
         assert!(payload.get("temperature").is_none());
         assert_eq!(payload["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn test_payload_non_reasoning_uses_max_tokens() {
+        let model = OpenAIModel::with_max_output_tokens(
+            "gpt-4o".to_string(),
+            "openai".to_string(),
+            "https://api.openai.com/v1".to_string(),
+            "sk-test".to_string(),
+            None,
+            HashMap::new(),
+            8192,
+        );
+        let msgs = vec![Message::User { content: "Hi".to_string() }];
+        let payload = model.build_payload(&msgs, &[], true);
+        assert_eq!(payload["max_tokens"], 8192);
+        assert!(payload.get("max_completion_tokens").is_none());
+    }
+
+    #[test]
+    fn test_payload_reasoning_uses_max_completion_tokens() {
+        let model = OpenAIModel::with_max_output_tokens(
+            "o3".to_string(),
+            "openai".to_string(),
+            "https://api.openai.com/v1".to_string(),
+            "sk-test".to_string(),
+            Some("high".to_string()),
+            HashMap::new(),
+            8192,
+        );
+        let msgs = vec![Message::User { content: "Hi".to_string() }];
+        let payload = model.build_payload(&msgs, &[], true);
+        assert_eq!(payload["max_completion_tokens"], 8192);
+        assert!(payload.get("max_tokens").is_none());
+    }
+
+    #[test]
+    fn test_default_max_output_tokens_is_32768() {
+        let model = make_model("gpt-4o", None);
+        let msgs = vec![Message::User { content: "Hi".to_string() }];
+        let payload = model.build_payload(&msgs, &[], true);
+        assert_eq!(payload["max_tokens"], 32768);
     }
 
     #[test]

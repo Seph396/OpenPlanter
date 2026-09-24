@@ -39,6 +39,13 @@ fn env_u32(key: &str, default: u32) -> u32 {
         .unwrap_or(default)
 }
 
+fn env_u64(key: &str, default: u64) -> u64 {
+    env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
 fn env_bool(key: &str, default: bool) -> bool {
     match env::var(key) {
         Ok(v) => matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes"),
@@ -106,6 +113,19 @@ pub struct AgentConfig {
     /// Model used for `execute` (leaf) children when set. Falls back to
     /// `subtask_model`, then the parent's model, when `None`.
     pub execute_model: Option<String>,
+
+    /// Maximum output tokens the model may generate in a single turn (passed
+    /// as `max_tokens`/`max_completion_tokens` to the provider). A live run
+    /// showed the previous hard-coded 16384 truncate a `write_file` call
+    /// mid-JSON, losing the file. Configurable so operators can raise it.
+    pub max_output_tokens: u64,
+
+    /// Poll deadline (seconds) for `exa_agent` calls specifically. Distinct
+    /// from `command_timeout_sec` (default 45s, meant for shell commands) —
+    /// live Exa Connect runs regularly take 60-120s, so most `exa_agent`
+    /// calls were timing out client-side while Exa's run continued (and
+    /// billed) server-side. `web::exa_agent` clamps this to <= 600s.
+    pub exa_agent_timeout_sec: u64,
 }
 
 impl Default for AgentConfig {
@@ -150,6 +170,8 @@ impl Default for AgentConfig {
             max_exa_agent_calls: 12,
             subtask_model: None,
             execute_model: None,
+            max_output_tokens: 32768,
+            exa_agent_timeout_sec: 300,
         }
     }
 }
@@ -251,6 +273,8 @@ impl AgentConfig {
             max_exa_agent_calls: env_u32("OPENPLANTER_MAX_EXA_AGENT_CALLS", 12),
             subtask_model: env_opt("OPENPLANTER_SUBTASK_MODEL"),
             execute_model: env_opt("OPENPLANTER_EXECUTE_MODEL"),
+            max_output_tokens: env_u64("OPENPLANTER_MAX_OUTPUT_TOKENS", 32768),
+            exa_agent_timeout_sec: env_u64("OPENPLANTER_EXA_AGENT_TIMEOUT", 300),
         }
     }
 }
@@ -293,6 +317,42 @@ mod tests {
         assert!(cfg.acceptance_criteria);
         assert!(!cfg.demo);
         assert_eq!(cfg.max_exa_agent_calls, 12);
+        assert_eq!(cfg.max_output_tokens, 32768);
+        assert_eq!(cfg.exa_agent_timeout_sec, 300);
+    }
+
+    #[test]
+    fn test_exa_agent_timeout_sec_from_env() {
+        let key = "OPENPLANTER_EXA_AGENT_TIMEOUT";
+        let saved = env::var(key).ok();
+        unsafe {
+            env::set_var(key, "120");
+        }
+        let cfg = AgentConfig::from_env("/tmp");
+        assert_eq!(cfg.exa_agent_timeout_sec, 120);
+        unsafe {
+            match saved {
+                Some(v) => env::set_var(key, v),
+                None => env::remove_var(key),
+            }
+        }
+    }
+
+    #[test]
+    fn test_max_output_tokens_from_env() {
+        let key = "OPENPLANTER_MAX_OUTPUT_TOKENS";
+        let saved = env::var(key).ok();
+        unsafe {
+            env::set_var(key, "8192");
+        }
+        let cfg = AgentConfig::from_env("/tmp");
+        assert_eq!(cfg.max_output_tokens, 8192);
+        unsafe {
+            match saved {
+                Some(v) => env::set_var(key, v),
+                None => env::remove_var(key),
+            }
+        }
     }
 
     #[test]

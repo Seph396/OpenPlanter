@@ -44,6 +44,8 @@ pub struct WorkspaceTools {
     root: PathBuf,
     shell_path: String,
     command_timeout_sec: u64,
+    /// Poll deadline for `exa_agent` specifically — see `AgentConfig::exa_agent_timeout_sec`.
+    exa_agent_timeout_sec: u64,
     max_shell_output_chars: usize,
     max_file_chars: usize,
     max_files_listed: usize,
@@ -73,6 +75,7 @@ impl WorkspaceTools {
             root: config.workspace.clone(),
             shell_path: config.shell.clone(),
             command_timeout_sec: config.command_timeout_sec as u64,
+            exa_agent_timeout_sec: config.exa_agent_timeout_sec,
             max_shell_output_chars: config.max_shell_output_chars as usize,
             max_file_chars: config.max_file_chars as usize,
             max_files_listed: config.max_files_listed as usize,
@@ -208,7 +211,7 @@ impl WorkspaceTools {
                     output_schema,
                     effort,
                     self.max_observation_chars,
-                    self.command_timeout_sec,
+                    self.exa_agent_timeout_sec,
                     &self.exa_call_counter,
                     self.max_exa_agent_calls,
                 )

@@ -175,9 +175,11 @@ function buildSettingsControls(
     reasoningSelect: HTMLSelectElement;
     recursiveCheckbox: HTMLInputElement;
     maxDepthInput: HTMLInputElement;
+    maxOutputTokensInput: HTMLInputElement;
     subtaskModelSelect: HTMLSelectElement;
     executeModelSelect: HTMLSelectElement;
     maxExaAgentCallsInput: HTMLInputElement;
+    exaAgentTimeoutSecInput: HTMLInputElement;
   };
   render: () => void;
 } {
@@ -230,6 +232,12 @@ function buildSettingsControls(
   maxDepthInput.max = "20";
   maxDepthInput.className = "settings-maxdepth-input";
 
+  const maxOutputTokensInput = document.createElement("input");
+  maxOutputTokensInput.type = "number";
+  maxOutputTokensInput.min = "1024";
+  maxOutputTokensInput.step = "1024";
+  maxOutputTokensInput.className = "settings-max-output-tokens-input";
+
   const subtaskModelSelect = document.createElement("select");
   subtaskModelSelect.className = "settings-subtask-model-select value";
 
@@ -240,6 +248,12 @@ function buildSettingsControls(
   maxExaAgentCallsInput.type = "number";
   maxExaAgentCallsInput.min = "0";
   maxExaAgentCallsInput.className = "settings-max-exa-agent-calls-input";
+
+  const exaAgentTimeoutSecInput = document.createElement("input");
+  exaAgentTimeoutSecInput.type = "number";
+  exaAgentTimeoutSecInput.min = "1";
+  exaAgentTimeoutSecInput.max = "600";
+  exaAgentTimeoutSecInput.className = "settings-exa-agent-timeout-input";
 
   const tierModelHint = document.createElement("div");
   tierModelHint.className = "settings-hint";
@@ -256,7 +270,8 @@ function buildSettingsControls(
     row("provider", providerSelect),
     row("model", modelSelect),
     modelIdRow,
-    row("reasoning", reasoningSelect)
+    row("reasoning", reasoningSelect),
+    row("max output tokens", maxOutputTokensInput)
   );
 
   agentsContainer.append(
@@ -265,7 +280,8 @@ function buildSettingsControls(
     row("sub-agent model", subtaskModelSelect),
     row("leaf model", executeModelSelect),
     tierModelHint,
-    row("exa call cap", maxExaAgentCallsInput)
+    row("exa call cap", maxExaAgentCallsInput),
+    row("exa timeout (s)", exaAgentTimeoutSecInput)
   );
 
   /** Populate the model select with known models for `provider`, keeping `currentModel` selected. */
@@ -350,6 +366,8 @@ function buildSettingsControls(
         subtaskModel: config.subtask_model,
         executeModel: config.execute_model,
         maxExaAgentCalls: config.max_exa_agent_calls,
+        maxOutputTokens: config.max_output_tokens,
+        exaAgentTimeoutSec: config.exa_agent_timeout_sec,
       }));
     } catch (e) {
       console.error("Failed to update config:", e);
@@ -402,6 +420,16 @@ function buildSettingsControls(
     if (!Number.isNaN(n) && n >= 0) applyPartial({ max_exa_agent_calls: n });
   });
 
+  maxOutputTokensInput.addEventListener("change", () => {
+    const n = parseInt(maxOutputTokensInput.value, 10);
+    if (!Number.isNaN(n) && n > 0) applyPartial({ max_output_tokens: n });
+  });
+
+  exaAgentTimeoutSecInput.addEventListener("change", () => {
+    const n = parseInt(exaAgentTimeoutSecInput.value, 10);
+    if (!Number.isNaN(n) && n > 0) applyPartial({ exa_agent_timeout_sec: n });
+  });
+
   // Last-rendered snapshot so unrelated appState updates (e.g. token counts
   // ticking during a run) don't overwrite in-progress edits in these controls.
   let last = {
@@ -413,6 +441,8 @@ function buildSettingsControls(
     subtaskModel: null as string | null,
     executeModel: null as string | null,
     maxExaAgentCalls: 0,
+    maxOutputTokens: 0,
+    exaAgentTimeoutSec: 0,
   };
   let modelOptionsLoadedFor = "";
   let tierModelOptionsLoadedFor = "";
@@ -447,6 +477,12 @@ function buildSettingsControls(
     if (s.maxExaAgentCalls !== last.maxExaAgentCalls) {
       maxExaAgentCallsInput.value = String(s.maxExaAgentCalls);
     }
+    if (s.maxOutputTokens !== last.maxOutputTokens) {
+      maxOutputTokensInput.value = String(s.maxOutputTokens);
+    }
+    if (s.exaAgentTimeoutSec !== last.exaAgentTimeoutSec) {
+      exaAgentTimeoutSecInput.value = String(s.exaAgentTimeoutSec);
+    }
     last = {
       provider: s.provider,
       model: s.model,
@@ -456,6 +492,8 @@ function buildSettingsControls(
       subtaskModel: s.subtaskModel,
       executeModel: s.executeModel,
       maxExaAgentCalls: s.maxExaAgentCalls,
+      maxOutputTokens: s.maxOutputTokens,
+      exaAgentTimeoutSec: s.exaAgentTimeoutSec,
     };
   }
 
@@ -466,9 +504,11 @@ function buildSettingsControls(
       reasoningSelect,
       recursiveCheckbox,
       maxDepthInput,
+      maxOutputTokensInput,
       subtaskModelSelect,
       executeModelSelect,
       maxExaAgentCallsInput,
+      exaAgentTimeoutSecInput,
     },
     render,
   };
@@ -712,6 +752,8 @@ async function openWorkspacePicker(
       maxDepth: config.max_depth,
       maxStepsPerCall: config.max_steps_per_call,
       maxExaAgentCalls: config.max_exa_agent_calls,
+      maxOutputTokens: config.max_output_tokens,
+      exaAgentTimeoutSec: config.exa_agent_timeout_sec,
       messages: [],
       inputTokens: 0,
       outputTokens: 0,

@@ -257,6 +257,34 @@ impl<E: SolveEmitter> SolveEmitter for LoggingEmitter<E> {
     }
 
     fn emit_error(&self, message: &str) {
+        // Persist to replay so a reloaded session shows why the run stopped
+        // (e.g. an HTTP error with the provider's response body) instead of
+        // silently ending with no trace of the failure.
+        let entry = ReplayEntry {
+            seq: 0,
+            timestamp: String::new(),
+            role: "error".into(),
+            content: message.to_string(),
+            tool_name: None,
+            is_rendered: None,
+            step_number: None,
+            step_tokens_in: None,
+            step_tokens_out: None,
+            step_cache_creation: None,
+            step_cache_read: None,
+            step_elapsed: None,
+            step_model_preview: None,
+            step_tool_calls: None,
+        };
+        let replay = self.replay.clone();
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                if let Err(e) = replay.lock().await.append(entry).await {
+                    eprintln!("[bridge] failed to log error: {e}");
+                }
+            });
+        });
+
         self.inner.emit_error(message);
     }
 
@@ -339,6 +367,20 @@ mod tests {
         assert!(assistant.is_some(), "expected an assistant entry");
         assert!(assistant.unwrap().content.contains("Test persistence"));
         assert_eq!(assistant.unwrap().is_rendered, Some(true));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_logging_emitter_emit_error_persists_error_row() {
+        let tmp = tempdir().unwrap();
+        let replay = ReplayLogger::new(tmp.path());
+        let emitter = LoggingEmitter::new(NullEmitter, replay);
+
+        emitter.emit_error("Anthropic 400 Bad Request: {\"error\":{\"message\":\"model not found\"}}");
+
+        let entries = ReplayLogger::read_all(tmp.path()).await.unwrap();
+        let error_entry = entries.iter().find(|e| e.role == "error");
+        assert!(error_entry.is_some(), "expected an error row in replay, got: {:?}", entries);
+        assert!(error_entry.unwrap().content.contains("model not found"));
     }
 
     #[tokio::test(flavor = "multi_thread")]

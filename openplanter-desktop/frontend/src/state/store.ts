@@ -80,6 +80,8 @@ export interface AppState {
   subtaskModel: string | null;
   executeModel: string | null;
   maxExaAgentCalls: number;
+  maxOutputTokens: number;
+  exaAgentTimeoutSec: number;
 }
 
 export const appState = new Store<AppState>({
@@ -104,4 +106,6 @@ export const appState = new Store<AppState>({
   subtaskModel: null,
   executeModel: null,
   maxExaAgentCalls: 12,
+  maxOutputTokens: 32768,
+  exaAgentTimeoutSec: 300,
 });

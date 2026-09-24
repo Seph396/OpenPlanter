@@ -149,6 +149,11 @@ pub fn run_child<'a>(
                 };
             }
 
+            // Guard against a poisoned history (an orphaned tool_use with no
+            // matching tool_result) 400ing every subsequent turn — see
+            // engine::sanitize_orphaned_tool_calls.
+            super::sanitize_orphaned_tool_calls(&mut messages);
+
             let turn = match model
                 .chat_stream(&messages, &tool_defs, &noop_delta, &cancel)
                 .await
@@ -176,6 +181,37 @@ pub fn run_child<'a>(
                 content: turn.text.clone(),
                 tool_calls: tool_calls_opt,
             });
+
+            // See engine::solve's identical guard — a truncated turn's tool
+            // call(s) may have incomplete/corrupt JSON arguments and must not
+            // be executed. Inject the cut-off observation and continue.
+            if turn.truncated {
+                ctx.emitter.emit_step(StepEvent {
+                    depth,
+                    step: step as u32,
+                    tool_name: turn.tool_calls.first().map(|tc| tc.name.clone()),
+                    tokens: TokenUsage {
+                        input_tokens: turn.input_tokens,
+                        output_tokens: turn.output_tokens,
+                        cache_creation_input_tokens: turn.cache_creation_input_tokens.unwrap_or(0),
+                        cache_read_input_tokens: turn.cache_read_input_tokens.unwrap_or(0),
+                    },
+                    elapsed_ms: 0,
+                    is_final: false,
+                });
+                let notice = super::truncated_turn_message(ctx.config.max_output_tokens);
+                if turn.tool_calls.is_empty() {
+                    messages.push(Message::User { content: notice });
+                } else {
+                    for tc in &turn.tool_calls {
+                        messages.push(Message::Tool {
+                            tool_call_id: tc.id.clone(),
+                            content: notice.clone(),
+                        });
+                    }
+                }
+                continue;
+            }
 
             if turn.tool_calls.is_empty() {
                 if !turn.text.is_empty() {
@@ -571,6 +607,22 @@ mod tests {
                     arguments: args.to_string(),
                 })
                 .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// A turn cut off at the output token limit mid-tool-call: `truncated:
+    /// true`, and `arguments` deliberately not valid JSON (as a real
+    /// truncated `input_json_delta` stream would leave it).
+    fn truncated_tool_call_turn(name: &str, partial_arguments: &str) -> crate::model::ModelTurn {
+        crate::model::ModelTurn {
+            text: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "tc-trunc".into(),
+                name: name.to_string(),
+                arguments: partial_arguments.to_string(),
+            }],
+            truncated: true,
             ..Default::default()
         }
     }
@@ -990,5 +1042,83 @@ mod tests {
         assert_eq!(result.text, "okay, wrapping up now");
         assert_eq!(result.steps, 2);
         assert_eq!(model.call_count.load(Ordering::SeqCst), 2);
+    }
+
+    // ── truncated-turn recovery (max_tokens cut-off mid-tool-call) ──
+
+    #[tokio::test]
+    async fn test_run_child_truncated_tool_call_not_executed_and_loop_continues() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = test_config(tmp.path());
+        // Turn 1: truncated mid-`write_file` call, corrupt JSON arguments.
+        // Turn 2: a clean final answer. If the truncated call were executed
+        // as-is, tool_counts would record "write_file"; the cut-off guard
+        // must skip execution entirely and just continue the loop.
+        let model = MockModel {
+            script: vec![
+                truncated_tool_call_turn("write_file", "{\"path\":\"out.txt\",\"content\":\"never clo"),
+                final_turn("wrote it on retry\nDONE"),
+            ],
+            call_count: AtomicUsize::new(0),
+            delay_ms: 0,
+        };
+        let emitter = NullEmitter;
+        let ctx = RecursionCtx {
+            config: &cfg,
+            emitter: &emitter,
+            model: &model,
+            provider: "openai",
+            system_prompt: "sys",
+            artifacts_dir: tmp.path().join(".openplanter/artifacts"),
+            exa_call_counter: Arc::new(AtomicU32::new(0)),
+        };
+        let result = run_child(&ctx, None, "objective".into(), 0, ToolMode::Recursive, CancellationToken::new()).await;
+
+        assert_eq!(model.call_count.load(Ordering::SeqCst), 2, "loop must continue to a second turn");
+        assert_eq!(result.kind, LoopKind::Final);
+        assert_eq!(result.text, "wrote it on retry");
+        assert_eq!(result.steps, 2);
+        assert!(
+            !result.tool_counts.contains_key("write_file"),
+            "the truncated tool call must NOT be executed/counted: {:?}",
+            result.tool_counts
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_child_truncated_text_only_turn_nudges_with_cutoff_notice() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = test_config(tmp.path());
+        // Truncated turn with NO tool calls (just cut-off narration text) —
+        // must still be treated as a non-final continuation, not finalized
+        // via the DONE/text-only path.
+        let model = MockModel {
+            script: vec![
+                crate::model::ModelTurn {
+                    text: "I was in the middle of explaining when I got cut off and this text just st".into(),
+                    truncated: true,
+                    ..Default::default()
+                },
+                final_turn("here is the real final answer\nDONE"),
+            ],
+            call_count: AtomicUsize::new(0),
+            delay_ms: 0,
+        };
+        let emitter = NullEmitter;
+        let ctx = RecursionCtx {
+            config: &cfg,
+            emitter: &emitter,
+            model: &model,
+            provider: "openai",
+            system_prompt: "sys",
+            artifacts_dir: tmp.path().join(".openplanter/artifacts"),
+            exa_call_counter: Arc::new(AtomicU32::new(0)),
+        };
+        let result = run_child(&ctx, None, "objective".into(), 0, ToolMode::Recursive, CancellationToken::new()).await;
+
+        assert_eq!(model.call_count.load(Ordering::SeqCst), 2);
+        assert_eq!(result.kind, LoopKind::Final);
+        assert_eq!(result.text, "here is the real final answer");
+        assert_eq!(result.steps, 2);
     }
 }

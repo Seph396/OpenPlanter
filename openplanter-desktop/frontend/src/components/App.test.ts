@@ -237,6 +237,76 @@ describe("createApp", () => {
     });
   });
 
+  it("editing the max output tokens input calls update_config with the new value", async () => {
+    let received: any = null;
+    __setHandler("update_config", (partial: any) => {
+      received = partial;
+      return {
+        provider: "anthropic",
+        model: "claude-opus-4-6",
+        reasoning_effort: null,
+        workspace: "/tmp/ws",
+        session_id: null,
+        recursive: true,
+        max_depth: 4,
+        max_steps_per_call: 100,
+        demo: false,
+        max_exa_agent_calls: 12,
+        max_output_tokens: 8192,
+        exa_agent_timeout_sec: 300,
+      };
+    });
+
+    const root = document.createElement("div");
+    document.body.appendChild(root);
+    createApp(root);
+
+    const input = root.querySelector(".settings-max-output-tokens-input") as HTMLInputElement;
+    expect(input).not.toBeNull();
+    input.value = "8192";
+    input.dispatchEvent(new Event("change"));
+
+    await vi.waitFor(() => {
+      expect(received.partial).toEqual({ max_output_tokens: 8192 });
+      expect(appState.get().maxOutputTokens).toBe(8192);
+    });
+  });
+
+  it("editing the exa agent timeout input calls update_config with the new value", async () => {
+    let received: any = null;
+    __setHandler("update_config", (partial: any) => {
+      received = partial;
+      return {
+        provider: "anthropic",
+        model: "claude-opus-4-6",
+        reasoning_effort: null,
+        workspace: "/tmp/ws",
+        session_id: null,
+        recursive: true,
+        max_depth: 4,
+        max_steps_per_call: 100,
+        demo: false,
+        max_exa_agent_calls: 12,
+        max_output_tokens: 32768,
+        exa_agent_timeout_sec: 120,
+      };
+    });
+
+    const root = document.createElement("div");
+    document.body.appendChild(root);
+    createApp(root);
+
+    const input = root.querySelector(".settings-exa-agent-timeout-input") as HTMLInputElement;
+    expect(input).not.toBeNull();
+    input.value = "120";
+    input.dispatchEvent(new Event("change"));
+
+    await vi.waitFor(() => {
+      expect(received.partial).toEqual({ exa_agent_timeout_sec: 120 });
+      expect(appState.get().exaAgentTimeoutSec).toBe(120);
+    });
+  });
+
   it("changing the provider select calls update_config with the new provider", async () => {
     let received: any = null;
     __setHandler("update_config", (partial: any) => {

@@ -142,6 +142,12 @@ pub struct ConfigView {
     /// Hard cap on `exa_agent` calls per run, shared across depth-0 and all children.
     #[serde(default)]
     pub max_exa_agent_calls: u32,
+    /// Maximum output tokens the model may generate in a single turn.
+    #[serde(default)]
+    pub max_output_tokens: u64,
+    /// Poll deadline (seconds) for `exa_agent` calls.
+    #[serde(default)]
+    pub exa_agent_timeout_sec: u64,
 }
 
 /// Partial configuration update from the frontend.

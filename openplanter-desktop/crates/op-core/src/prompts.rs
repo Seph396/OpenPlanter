@@ -379,6 +379,7 @@ BAD criteria (not independently checkable):
 
 pub const COMPLETION_PROTOCOL_SECTION: &str = r#"
 == COMPLETION ==
+Large files: write in chunks with write_file then edit_file; never emit more than a few thousand words in one tool call.
 When your work is complete, end your final message with the line `DONE`."#;
 
 pub const DEMO_SECTION: &str = r#"
@@ -452,6 +453,10 @@ mod tests {
                 "expected COMPLETION section for ({recursive}, {acceptance}, {demo})"
             );
             assert!(prompt.trim_end().ends_with("end your final message with the line `DONE`."));
+            assert!(
+                prompt.contains("Large files: write in chunks with write_file then edit_file"),
+                "expected large-file chunking note for ({recursive}, {acceptance}, {demo})"
+            );
         }
     }
 

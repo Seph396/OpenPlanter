@@ -24,6 +24,7 @@ impl AnthropicModel {
         base_url: String,
         api_key: String,
         reasoning_effort: Option<String>,
+        max_output_tokens: u64,
     ) -> Self {
         Self {
             client: reqwest::Client::new(),
@@ -31,7 +32,7 @@ impl AnthropicModel {
             base_url,
             api_key,
             reasoning_effort,
-            max_tokens: 16384,
+            max_tokens: max_output_tokens,
         }
     }
 
@@ -285,6 +286,7 @@ impl BaseModel for AnthropicModel {
         let mut output_tokens: u64 = 0;
         let mut cache_creation_input_tokens: Option<u64> = None;
         let mut cache_read_input_tokens: Option<u64> = None;
+        let mut stop_reason: Option<String> = None;
 
         // Track content blocks by index for tool calls
         struct BlockState {
@@ -323,6 +325,12 @@ impl BaseModel for AnthropicModel {
             let event = match event {
                 Some(Ok(ev)) => ev,
                 Some(Err(reqwest_eventsource::Error::StreamEnded)) => break,
+                Some(Err(reqwest_eventsource::Error::InvalidStatusCode(status, response))) => {
+                    es.close();
+                    let body = response.text().await.unwrap_or_default();
+                    let snippet: String = body.chars().take(600).collect();
+                    return Err(anyhow!("Anthropic {status}: {snippet}"));
+                }
                 Some(Err(e)) => {
                     es.close();
                     return Err(anyhow!("SSE stream error: {e}"));
@@ -462,6 +470,9 @@ impl BaseModel for AnthropicModel {
                         }
 
                         "message_delta" => {
+                            if let Some(sr) = data.pointer("/delta/stop_reason").and_then(|v| v.as_str()) {
+                                stop_reason = Some(sr.to_string());
+                            }
                             if let Some(usage) = data.get("usage") {
                                 if let Some(ot) = usage.get("output_tokens").and_then(|v| v.as_u64()) {
                                     output_tokens = ot;
@@ -504,6 +515,7 @@ impl BaseModel for AnthropicModel {
             output_tokens,
             cache_creation_input_tokens,
             cache_read_input_tokens,
+            truncated: stop_reason.as_deref() == Some("max_tokens"),
         })
     }
 
@@ -526,6 +538,7 @@ mod tests {
             "https://api.anthropic.com/v1".to_string(),
             "sk-ant-test".to_string(),
             reasoning_effort.map(|s| s.to_string()),
+            16384,
         )
     }
 
@@ -639,6 +652,20 @@ mod tests {
     }
 
     // ── build_payload ──
+
+    #[test]
+    fn test_payload_uses_configured_max_output_tokens() {
+        let model = AnthropicModel::new(
+            "claude-sonnet-4-5".to_string(),
+            "https://api.anthropic.com/v1".to_string(),
+            "sk-ant-test".to_string(),
+            None,
+            8192,
+        );
+        let msgs = vec![Message::User { content: "Hi".to_string() }];
+        let payload = model.build_payload(&msgs, &[]);
+        assert_eq!(payload["max_tokens"], 8192);
+    }
 
     #[test]
     fn test_payload_no_thinking_has_temperature() {

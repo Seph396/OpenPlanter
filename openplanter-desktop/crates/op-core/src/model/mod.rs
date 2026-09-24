@@ -30,6 +30,12 @@ pub struct ModelTurn {
     /// Tokens read from the prompt cache on this turn (Anthropic only; `None` if not reported).
     #[serde(default)]
     pub cache_read_input_tokens: Option<u64>,
+    /// `true` when this turn was cut off by the provider's output token limit
+    /// (Anthropic `stop_reason == "max_tokens"`, OpenAI-shaped
+    /// `finish_reason == "length"`). Any tool call(s) in `tool_calls` may have
+    /// incomplete/corrupt `arguments` JSON and must not be executed as-is.
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 /// A conversation message.

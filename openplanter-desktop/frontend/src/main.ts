@@ -44,6 +44,8 @@ async function init() {
       subtaskModel: config.subtask_model,
       executeModel: config.execute_model,
       maxExaAgentCalls: config.max_exa_agent_calls,
+      maxOutputTokens: config.max_output_tokens,
+      exaAgentTimeoutSec: config.exa_agent_timeout_sec,
     }));
   } catch (e) {
     console.error("Failed to load config:", e);
